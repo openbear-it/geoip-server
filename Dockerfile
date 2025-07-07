@@ -16,7 +16,6 @@ FROM scratch
 
 WORKDIR /app
 COPY --from=builder /app/geoip-server .
-COPY --from=builder /app/ip2location.csv .
 
 EXPOSE 8080
 

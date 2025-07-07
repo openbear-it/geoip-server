@@ -31,15 +31,20 @@ type clientData struct {
 }
 
 var (
-	ipRanges    []ipRange
-	statsMu     sync.RWMutex
-	clientStats = make(map[string]*clientData)
+	ipRanges      []ipRange
+	statsMu       sync.RWMutex
+	clientStats   = make(map[string]*clientData)
+	dbLoaded      bool // Indicates if the database was loaded successfully
+	dbLoadedMutex sync.RWMutex
 )
 
 func main() {
 	err := loadIPDatabase(dbFile)
 	if err != nil {
-		log.Fatalf("Failed to load IP2Location database: %v", err)
+		log.Printf("Warning: Failed to load IP2Location database: %v. Country lookup will be disabled.", err)
+		setDBLoaded(false)
+	} else {
+		setDBLoaded(true)
 	}
 
 	mux := http.NewServeMux()
@@ -99,11 +104,28 @@ func loadIPDatabase(path string) error {
 	return nil
 }
 
+// Sets the dbLoaded flag in a thread-safe way
+func setDBLoaded(loaded bool) {
+	dbLoadedMutex.Lock()
+	defer dbLoadedMutex.Unlock()
+	dbLoaded = loaded
+}
+
+// Gets the dbLoaded flag in a thread-safe way
+func isDBLoaded() bool {
+	dbLoadedMutex.RLock()
+	defer dbLoadedMutex.RUnlock()
+	return dbLoaded
+}
+
 // Returns the country corresponding to an IP
 func lookupCountry(ip net.IP) string {
+	if !isDBLoaded() {
+		return ""
+	}
 	ip4 := ip.To4()
 	if ip4 == nil {
-		return "Unknown"
+		return ""
 	}
 	ipInt := binaryIPToInt(ip4)
 
@@ -113,7 +135,7 @@ func lookupCountry(ip net.IP) string {
 			return rng.country
 		}
 	}
-	return "Unknown"
+	return ""
 }
 
 func binaryIPToInt(ip net.IP) uint32 {
@@ -192,12 +214,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := map[string]string{
+		"ip": ipStr,
+	}
+
 	country := lookupCountry(ip)
+	if country != "" {
+		resp["country"] = country
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	resp := map[string]string{
-		"ip":      ipStr,
-		"country": country,
-	}
 	json.NewEncoder(w).Encode(resp)
 }

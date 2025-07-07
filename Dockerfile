@@ -2,8 +2,11 @@
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
+
+# Copy go.mod if it exists, otherwise skip go.sum
+COPY go.mod ./
+# Only run go mod download if go.mod is present
+RUN [ -f go.mod ] && go mod download || true
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o geoip-server main.go

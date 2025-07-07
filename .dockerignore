@@ -1,0 +1,7 @@
+# Ignore everything except source and CSV
+.git
+*.md
+*.log
+*.test
+Dockerfile
+.dockerignore

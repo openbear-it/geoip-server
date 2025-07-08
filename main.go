@@ -49,13 +49,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/ip", rateLimitMiddleware(http.HandlerFunc(handlerJSON)))
-	mux.Handle("/ip/plain", rateLimitMiddleware(http.HandlerFunc(handlerPlain)))
+	mux.Handle("/", rateLimitMiddleware(http.HandlerFunc(handlerJSON)))
+	mux.Handle("/plain", rateLimitMiddleware(http.HandlerFunc(handlerPlain)))
 	mux.Handle("/health", http.HandlerFunc(healthHandler))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/ip", http.StatusTemporaryRedirect)
-		logRequest(r, http.StatusTemporaryRedirect, " [redirect to /ip]")
-	})
 
 	server := &http.Server{
 		Addr:         serverPort,

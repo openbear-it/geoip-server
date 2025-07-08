@@ -41,14 +41,21 @@ var (
 func main() {
 	err := loadIPDatabase(dbFile)
 	if err != nil {
-		log.Printf("Warning: Failed to load IP2Location database: %v. Country lookup will be disabled.", err)
+		log.Printf("[WARN] Failed to load IP2Location database: %v. Country lookup will be disabled.", err)
 		setDBLoaded(false)
 	} else {
 		setDBLoaded(true)
+		log.Printf("[INFO] IP2Location database loaded successfully.")
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", rateLimitMiddleware(http.HandlerFunc(handler)))
+	mux.Handle("/ip", rateLimitMiddleware(http.HandlerFunc(handlerJSON)))
+	mux.Handle("/ip/plain", rateLimitMiddleware(http.HandlerFunc(handlerPlain)))
+	mux.Handle("/health", http.HandlerFunc(healthHandler))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ip", http.StatusTemporaryRedirect)
+		logRequest(r, http.StatusTemporaryRedirect, " [redirect to /ip]")
+	})
 
 	server := &http.Server{
 		Addr:         serverPort,
@@ -58,7 +65,7 @@ func main() {
 		IdleTimeout:  30 * time.Second,
 	}
 
-	log.Printf("Server started on %s", serverPort)
+	log.Printf("[INFO] Server started on %s", serverPort)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -80,14 +87,14 @@ func loadIPDatabase(path string) error {
 
 	for i, record := range records {
 		if len(record) < 3 {
-			log.Printf("⚠️  Row %d ignored (only %d columns)", i+1, len(record))
+			log.Printf("[WARN] Row %d ignored (only %d columns)", i+1, len(record))
 			continue
 		}
 
 		startIP, err1 := strconv.ParseUint(record[0], 10, 32)
 		endIP, err2 := strconv.ParseUint(record[1], 10, 32)
 		if err1 != nil || err2 != nil {
-			log.Printf("⚠️  Row %d has invalid IPs", i+1)
+			log.Printf("[WARN] Row %d has invalid IPs", i+1)
 			continue
 		}
 
@@ -100,7 +107,7 @@ func loadIPDatabase(path string) error {
 		})
 	}
 
-	log.Printf("Loaded %d IP ranges from IP2Location database", len(ipRanges))
+	log.Printf("[INFO] Loaded %d IP ranges from IP2Location database", len(ipRanges))
 	return nil
 }
 
@@ -147,7 +154,9 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := getIP(r)
 		if ip == "" {
+			log.Printf("[ERROR] Invalid IP address in request - UA: %q", r.UserAgent())
 			http.Error(w, "Invalid IP address", http.StatusBadRequest)
+			logRequest(r, http.StatusBadRequest, " [invalid ip]")
 			return
 		}
 
@@ -173,14 +182,15 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 
 		if len(data.timestamps) >= requestLimit {
 			data.mu.Unlock()
+			log.Printf("[WARN] Rate limit exceeded for IP %s - UA: %q", ip, r.UserAgent())
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
+			logRequest(r, http.StatusTooManyRequests, " [rate limit]")
 			return
 		}
 
 		data.timestamps = append(data.timestamps, now)
 		data.mu.Unlock()
 
-		// Add security headers
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
@@ -205,19 +215,27 @@ func getIP(r *http.Request) string {
 	return ip
 }
 
-// Main handler
-func handler(w http.ResponseWriter, r *http.Request) {
+func logRequest(r *http.Request, status int, extra string) {
+	ip := getIP(r)
+	ua := r.UserAgent()
+	log.Printf("[INFO] %s %s - IP: %s - UA: %q - Status: %d%s",
+		r.Method, r.URL.Path, ip, ua, status, extra)
+}
+
+// JSON handler for /api/myip
+func handlerJSON(w http.ResponseWriter, r *http.Request) {
 	ipStr := getIP(r)
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
+		log.Printf("[ERROR] Invalid IP address in handlerJSON - UA: %q", r.UserAgent())
 		http.Error(w, "Invalid IP address", http.StatusBadRequest)
+		logRequest(r, http.StatusBadRequest, " [invalid ip]")
 		return
 	}
 
 	resp := map[string]string{
 		"ip": ipStr,
 	}
-
 	country := lookupCountry(ip)
 	if country != "" {
 		resp["country"] = country
@@ -225,4 +243,34 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+	logRequest(r, http.StatusOK, "")
+}
+
+// Plain text handler for /api/myip/plain
+func handlerPlain(w http.ResponseWriter, r *http.Request) {
+	ipStr := getIP(r)
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		log.Printf("[ERROR] Invalid IP address in handlerPlain - UA: %q", r.UserAgent())
+		http.Error(w, "Invalid IP address", http.StatusBadRequest)
+		logRequest(r, http.StatusBadRequest, " [invalid ip]")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(ipStr))
+	logRequest(r, http.StatusOK, "")
+}
+
+// Health check handler for /health
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	status := "ok"
+	if !isDBLoaded() {
+		status = "degraded"
+	}
+	resp := map[string]string{
+		"status": status,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+	logRequest(r, http.StatusOK, "")
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -156,8 +157,16 @@ func downloadDatabase(dbName string) error {
 	log.Printf("[INFO] Downloading database %s...", dbName)
 
 	// Create database URL
-	url := fmt.Sprintf(githubRawURL, dbName)	// Download the file
-	resp, err := http.Get(url)
+	url := fmt.Sprintf(githubRawURL, dbName)
+	
+	// Create a custom HTTP client that skips TLS verification
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr}
+	
+	// Download the file
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to download database: %v", err)
 	}

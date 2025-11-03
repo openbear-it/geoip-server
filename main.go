@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"compress/gzip"
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -117,8 +119,8 @@ const (
 	windowDuration = time.Minute        // Time window for rate limiting
 
 	// IP location database configuration
-	githubRawURL = "https://raw.githubusercontent.com/sapics/ip-location-db/main/iptoasn-asn/%s"
-	defaultDB    = "iptoasn-asn-ipv4.csv"    // Default database file to download and use
+	githubBaseURL = "https://raw.githubusercontent.com/sapics/ip-location-db/main"
+	cityDB        = "dbip-city/dbip-city-ipv4.csv.gz" // Single gzipped city DB to use
 )
 
 // findIPRange performs a binary search to efficiently locate the IP range containing the given IP
@@ -156,8 +158,8 @@ func downloadDatabase(dbName string) error {
 
 	log.Printf("[INFO] Downloading database %s...", dbName)
 
-	// Create database URL
-	url := fmt.Sprintf(githubRawURL, dbName)
+	// Create database URL for the city DB
+	url := fmt.Sprintf("%s/%s", githubBaseURL, dbName)
 	
 	// Create a custom HTTP client that skips TLS verification
 	tr := &http.Transport{
@@ -199,18 +201,18 @@ func downloadDatabase(dbName string) error {
 	return nil
 }
 
-// loadIPDatabases manages the loading of IP location databases.
+// loadIPDatabases manages loading the single gzipped city database.
 // It downloads the database if needed, handles backup of existing data,
-// and updates the metrics after successful loading.
+// loads the city DB and updates metrics.
 func loadIPDatabases() error {
-	log.Printf("[INFO] Loading IP database...")
+	log.Printf("[INFO] Loading IP database (city DB)...")
 
-	if err := downloadDatabase(defaultDB); err != nil {
-		log.Printf("[ERROR] Failed to download database: %v", err)
+	if err := downloadDatabase(cityDB); err != nil {
+		log.Printf("[ERROR] Failed to download city database: %v", err)
 		return err
 	}
 
-	// Backup existing database before loading
+	// Backup existing ranges
 	if len(ipRanges) > 0 {
 		oldRanges := make([]ipRange, len(ipRanges))
 		copy(oldRanges, ipRanges)
@@ -222,19 +224,18 @@ func loadIPDatabases() error {
 		}()
 	}
 
-	ipRanges = make([]ipRange, 0) // Reset before loading
-	if err := loadIP2Location(defaultDB); err != nil {
-		return fmt.Errorf("failed to load database: %v", err)
+	ipRanges = make([]ipRange, 0)
+	if err := loadCityDB(cityDB); err != nil {
+		return fmt.Errorf("failed to load city DB: %v", err)
 	}
 
 	if len(ipRanges) == 0 {
-		return fmt.Errorf("no IP ranges were loaded from database")
+		return fmt.Errorf("no IP ranges were loaded from city DB")
 	}
 
 	sortIPRanges()
 	log.Printf("[INFO] Total IP ranges loaded and sorted: %d", len(ipRanges))
-	
-	// Aggiorna le metriche
+
 	updateMetrics(func(m *metrics) {
 		m.DatabaseSize = len(ipRanges)
 		m.LastRefresh = time.Now()
@@ -337,75 +338,120 @@ func binaryIPToInt(ip net.IP) uint32 {
 // loadIP2Location loads and parses the IP location database from CSV format.
 // It handles various data validations including IP format, ASN parsing,
 // and proper IPv4 address conversion. Invalid entries are logged and skipped.
-func loadIP2Location(path string) error {
-    file, err := os.Open(path)
-    if err != nil {
-        return err
-    }
-    defer file.Close()
+// loadCityDB reads a gzipped CSV city database and populates ipRanges.
+// Expected CSV columns (dbip-city common layout):
+// ip_from,ip_to,country_code,country_name,region,city,latitude,longitude
+func loadCityDB(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
-    reader := csv.NewReader(file)
-    reader.LazyQuotes = true
+	var rdr io.Reader = f
+	if filepath.Ext(path) == ".gz" {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("failed to create gzip reader: %v", err)
+		}
+		defer gz.Close()
+		rdr = gz
+	}
 
-    // Skip header if present
-    _, err = reader.Read()
-    if err != nil {
-        return err
-    }
+	csvr := csv.NewReader(rdr)
+	csvr.LazyQuotes = true
 
-    for i := 1; ; i++ {
-        record, err := reader.Read()
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            log.Printf("[WARN] Error reading row %d: %v", i, err)
-            continue
-        }
+	// Read header
+	header, err := csvr.Read()
+	if err != nil {
+		return fmt.Errorf("failed to read header: %v", err)
+	}
 
-        if len(record) < 4 {  // format: start_ip, end_ip, asn, country_code
-            log.Printf("[WARN] Row %d ignored (only %d columns)", i, len(record))
-            continue
-        }
+	idx := make(map[string]int)
+	for i, h := range header {
+		idx[h] = i
+	}
 
-        // Convert IPs from dotted decimal format to uint32
-        startIP := net.ParseIP(record[0])
-        endIP := net.ParseIP(record[1])
-        if startIP == nil || endIP == nil {
-            log.Printf("[WARN] Row %d has invalid IP format", i)
-            continue
-        }
+	get := func(rec []string, name string, fallback int) string {
+		if pos, ok := idx[name]; ok && pos < len(rec) {
+			return rec[pos]
+		}
+		if fallback >= 0 && fallback < len(rec) {
+			return rec[fallback]
+		}
+		return ""
+	}
 
-        // Convert to IPv4
-        startIP = startIP.To4()
-        endIP = endIP.To4()
-        if startIP == nil || endIP == nil {
-            log.Printf("[WARN] Row %d has invalid IPv4 addresses", i)
-            continue
-        }
+	for i := 1; ; i++ {
+		rec, err := csvr.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("[WARN] Error reading city DB row %d: %v", i, err)
+			continue
+		}
 
-        asn, err := strconv.Atoi(record[2])
-        if err != nil {
-            log.Printf("[WARN] Row %d has invalid ASN: %v", i, err)
-            continue
-        }
+		startStr := get(rec, "ip_from", 0)
+		endStr := get(rec, "ip_to", 1)
 
-        countryCode := record[3]
+		var startIP, endIP net.IP
+		if startStr != "" && !strings.Contains(startStr, ".") {
+			v, err := strconv.ParseUint(startStr, 10, 64)
+			if err == nil {
+				b := []byte{byte((v >> 24) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 8) & 0xFF), byte(v & 0xFF)}
+				startIP = net.IPv4(b[0], b[1], b[2], b[3])
+			}
+		} else if startStr != "" {
+			startIP = net.ParseIP(startStr)
+		}
 
-        ipRanges = append(ipRanges, ipRange{
-            start: binaryIPToInt(startIP),
-            end:   binaryIPToInt(endIP),
-            location: GeoLocation{
-                CountryCode: countryCode,
-                Country:    countryCode,
-                ASN:       asn,
-                Sources:   []string{"iptoasn"},
-            },
-        })
-    }
+		if endStr != "" && !strings.Contains(endStr, ".") {
+			v, err := strconv.ParseUint(endStr, 10, 64)
+			if err == nil {
+				b := []byte{byte((v >> 24) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 8) & 0xFF), byte(v & 0xFF)}
+				endIP = net.IPv4(b[0], b[1], b[2], b[3])
+			}
+		} else if endStr != "" {
+			endIP = net.ParseIP(endStr)
+		}
 
-    log.Printf("[INFO] Loaded %d IP ranges from IPtoASN database", len(ipRanges))
-    return nil
+		if startIP == nil || endIP == nil {
+			log.Printf("[WARN] Row %d: invalid IPs (%s - %s)", i, startStr, endStr)
+			continue
+		}
+
+		s4 := startIP.To4()
+		e4 := endIP.To4()
+		if s4 == nil || e4 == nil {
+			log.Printf("[WARN] Row %d: non-IPv4 addresses", i)
+			continue
+		}
+
+		country := get(rec, "country_code", 2)
+		city := get(rec, "city", 5)
+		latStr := get(rec, "latitude", 6)
+		lonStr := get(rec, "longitude", 7)
+
+		lat, _ := strconv.ParseFloat(latStr, 64)
+		lon, _ := strconv.ParseFloat(lonStr, 64)
+
+		ipRanges = append(ipRanges, ipRange{
+			start: binaryIPToInt(s4),
+			end:   binaryIPToInt(e4),
+			location: GeoLocation{
+				CountryCode: country,
+				Country:     country,
+				City:        city,
+				Latitude:    lat,
+				Longitude:   lon,
+				Sources:     []string{"dbip-city"},
+			},
+		})
+	}
+
+	log.Printf("[INFO] Loaded %d IP ranges from city DB", len(ipRanges))
+	return nil
 }
 
 // Sets the dbLoaded flag in a thread-safe way
@@ -422,7 +468,7 @@ func isDBLoaded() bool {
 	return dbLoaded
 }
 
-// Loads the IP2Location CSV database into memory
+// (removed old ASN-country loader - using single dbip-city gzip CSV instead)
 
 // rateLimitMiddleware implements rate limiting per IP address.
 // It enforces request limits within a sliding time window and

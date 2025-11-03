@@ -17,20 +17,20 @@ import (
 	"time"
 )
 
-// Global variables
+// Global variables for managing IP ranges, database state, and request tracking
 var (
-	ipRanges       []ipRange
-	ipRangesMutex  sync.RWMutex
-	dbLoadedMutex  sync.RWMutex
-	dbLoaded       bool
-	requestCounter = make(map[string]int)
-	requestMutex   sync.RWMutex
-	startTime      = time.Now()
-	clientStats    = make(map[string]*clientData)
-	statsMu        sync.RWMutex
+	ipRanges       []ipRange        // Stores IP ranges with their associated location data
+	ipRangesMutex  sync.RWMutex     // Protects concurrent access to ipRanges
+	dbLoadedMutex  sync.RWMutex     // Protects concurrent access to dbLoaded flag
+	dbLoaded       bool             // Indicates whether the database is loaded and ready
+	requestCounter = make(map[string]int) // Tracks requests per source
+	requestMutex   sync.RWMutex     // Protects concurrent access to requestCounter
+	startTime      = time.Now()     // Server start time for uptime tracking
+	clientStats    = make(map[string]*clientData) // Stores client request statistics for rate limiting
+	statsMu        sync.RWMutex     // Protects concurrent access to clientStats
 )
 
-// Cache implementation
+// Cache implementation for reducing database lookups
 type cacheEntry struct {
 	data       []byte
 	expiration time.Time
@@ -111,16 +111,17 @@ type ipRange struct {
 }
 
 const (
-	serverPort     = "0.0.0.0:8080"
-	requestLimit   = 10
-	windowDuration = time.Minute
+	serverPort     = "0.0.0.0:8080"    // Server listening address and port
+	requestLimit   = 10                 // Maximum requests per client in the time window
+	windowDuration = time.Minute        // Time window for rate limiting
 
-	// Solo il database iptoasn
+	// IP location database configuration
 	githubRawURL = "https://raw.githubusercontent.com/sapics/ip-location-db/main/iptoasn-asn/%s"
-	defaultDB    = "iptoasn-asn-ipv4.csv"    // Database predefinito da scaricare
+	defaultDB    = "iptoasn-asn-ipv4.csv"    // Default database file to download and use
 )
 
-// Binary Search implementation per migliorare le performance
+// findIPRange performs a binary search to efficiently locate the IP range containing the given IP
+// Returns a pointer to the matching ipRange or nil if not found
 func findIPRange(ipInt uint32, ranges []ipRange) *ipRange {
 	ipRangesMutex.RLock()
 	defer ipRangesMutex.RUnlock()
@@ -143,9 +144,10 @@ func findIPRange(ipInt uint32, ranges []ipRange) *ipRange {
 }
 
 // downloadDatabase scarica il database CSV se non esiste localmente
-// downloadDatabase scarica il database CSV se non esiste localmente
+// downloadDatabase downloads the CSV database if it doesn't exist locally.
+// It handles file creation, directory setup, and data download from the remote source.
 func downloadDatabase(dbName string) error {
-	// Verifica se il file esiste già
+    // Check if the file already exists
 	if _, err := os.Stat(dbName); err == nil {
 		log.Printf("[INFO] Database %s already exists", dbName)
 		return nil
@@ -153,10 +155,8 @@ func downloadDatabase(dbName string) error {
 
 	log.Printf("[INFO] Downloading database %s...", dbName)
 
-	// Crea l'URL del database
-	url := fmt.Sprintf(githubRawURL, dbName)
-
-	// Scarica il file
+	// Create database URL
+	url := fmt.Sprintf(githubRawURL, dbName)	// Download the file
 	resp, err := http.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to download database: %v", err)
@@ -167,20 +167,20 @@ func downloadDatabase(dbName string) error {
 		return fmt.Errorf("failed to download database, status: %s", resp.Status)
 	}
 
-	// Crea la directory se non esiste
+	// Create directory if it doesn't exist
 	dir := filepath.Dir(dbName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
-	// Crea il file locale
+	// Create local file
 	out, err := os.Create(dbName)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %v", err)
 	}
 	defer out.Close()
 
-	// Copia il contenuto
+	// Copy content
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to save database: %v", err)
@@ -190,7 +190,9 @@ func downloadDatabase(dbName string) error {
 	return nil
 }
 
-// Semplifichiamo loadIPDatabases per usare solo il database iptoasn
+// loadIPDatabases manages the loading of IP location databases.
+// It downloads the database if needed, handles backup of existing data,
+// and updates the metrics after successful loading.
 func loadIPDatabases() error {
 	log.Printf("[INFO] Loading IP database...")
 
@@ -199,7 +201,7 @@ func loadIPDatabases() error {
 		return err
 	}
 
-	// Backup del database esistente prima del caricamento
+	// Backup existing database before loading
 	if len(ipRanges) > 0 {
 		oldRanges := make([]ipRange, len(ipRanges))
 		copy(oldRanges, ipRanges)
@@ -211,7 +213,7 @@ func loadIPDatabases() error {
 		}()
 	}
 
-	ipRanges = make([]ipRange, 0) // Reset prima del caricamento
+	ipRanges = make([]ipRange, 0) // Reset before loading
 	if err := loadIP2Location(defaultDB); err != nil {
 		return fmt.Errorf("failed to load database: %v", err)
 	}
@@ -232,7 +234,9 @@ func loadIPDatabases() error {
 	return nil
 }
 
-// Versione migliorata del handler JSON
+// handlerJSON processes JSON requests for IP geolocation.
+// It implements caching, input validation, and error handling.
+// Returns IP location data in JSON format with appropriate HTTP status codes.
 func handlerJSON(w http.ResponseWriter, r *http.Request) {
     start := time.Now()
     ipStr := getIP(r)
@@ -256,7 +260,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Verifica che sia un IPv4 valido
+    // Verify it's a valid IPv4 address
     ip4 := ip.To4()
     if ip4 == nil {
         err := fmt.Errorf("IPv6 not supported")
@@ -269,7 +273,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
     location := findIPRange(ipInt, ipRanges)
 
     if location == nil {
-        // Se non troviamo il range, restituiamo comunque l'IP
+        // If we don't find a range, still return the IP
         response := GeoLocation{
             IP:      ipStr,
             Sources: []string{"unknown"},
@@ -288,7 +292,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Assicuriamoci di avere l'IP corretto nella risposta
+    // Ensure we have the correct IP in the response
     location.location.IP = ipStr
     
     response, err := json.Marshal(location.location)
@@ -313,7 +317,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
     logRequest(r, http.StatusOK, time.Since(start), nil)
 }
 
-// Funzione più sicura per convertire IP in uint32
+// binaryIPToInt safely converts an IP address to uint32
 func binaryIPToInt(ip net.IP) uint32 {
     if ip == nil || len(ip) < 4 {
         return 0
@@ -321,7 +325,9 @@ func binaryIPToInt(ip net.IP) uint32 {
     return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
 }
 
-// Loads the IP2Location CSV database into memory
+// loadIP2Location loads and parses the IP location database from CSV format.
+// It handles various data validations including IP format, ASN parsing,
+// and proper IPv4 address conversion. Invalid entries are logged and skipped.
 func loadIP2Location(path string) error {
     file, err := os.Open(path)
     if err != nil {
@@ -332,7 +338,7 @@ func loadIP2Location(path string) error {
     reader := csv.NewReader(file)
     reader.LazyQuotes = true
 
-    // Salta l'header se presente
+    // Skip header if present
     _, err = reader.Read()
     if err != nil {
         return err
@@ -348,12 +354,12 @@ func loadIP2Location(path string) error {
             continue
         }
 
-        if len(record) < 4 {  // formato: start_ip, end_ip, asn, country_code
+        if len(record) < 4 {  // format: start_ip, end_ip, asn, country_code
             log.Printf("[WARN] Row %d ignored (only %d columns)", i, len(record))
             continue
         }
 
-        // Converte gli IP da formato dotted decimal a uint32
+        // Convert IPs from dotted decimal format to uint32
         startIP := net.ParseIP(record[0])
         endIP := net.ParseIP(record[1])
         if startIP == nil || endIP == nil {
@@ -361,7 +367,7 @@ func loadIP2Location(path string) error {
             continue
         }
 
-        // Converti in IPv4
+        // Convert to IPv4
         startIP = startIP.To4()
         endIP = endIP.To4()
         if startIP == nil || endIP == nil {
@@ -393,100 +399,6 @@ func loadIP2Location(path string) error {
     return nil
 }
 
-// Loads the DB-IP CSV database into memory
-func loadDBIP(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	reader.LazyQuotes = true
-
-	records, err := reader.ReadAll()
-	if err != nil {
-		return err
-	}
-
-	for i, record := range records {
-		if len(record) < 3 {
-			continue
-		}
-
-		startIP := net.ParseIP(record[0])
-		endIP := net.ParseIP(record[1])
-		if startIP == nil || endIP == nil {
-			log.Printf("[WARN] Invalid IP range at row %d", i)
-			continue
-		}
-
-		ipRanges = append(ipRanges, ipRange{
-			start: binaryIPToInt(startIP.To4()),
-			end:   binaryIPToInt(endIP.To4()),
-			location: GeoLocation{
-				Country:     record[2],
-				CountryCode: record[2],
-				Sources:     []string{"dbip"},
-			},
-		})
-	}
-
-	log.Printf("[INFO] Loaded %d ranges from DB-IP database", len(records))
-	return nil
-}
-
-// Loads the Geofeed CSV database into memory
-func loadGeoFeed(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	reader.LazyQuotes = true
-
-	records, err := reader.ReadAll()
-	if err != nil {
-		return err
-	}
-
-	for i, record := range records {
-		if len(record) < 3 {
-			continue
-		}
-
-		_, network, err := net.ParseCIDR(record[0])
-		if err != nil {
-			log.Printf("[WARN] Invalid CIDR at row %d: %v", i, err)
-			continue
-		}
-
-		// Convert CIDR to start/end IP range
-		startIP := network.IP
-		mask := network.Mask
-		endIP := make(net.IP, len(startIP))
-		copy(endIP, startIP)
-		for i := range endIP {
-			endIP[i] |= ^mask[i]
-		}
-
-		ipRanges = append(ipRanges, ipRange{
-			start: binaryIPToInt(startIP.To4()),
-			end:   binaryIPToInt(endIP.To4()),
-			location: GeoLocation{
-				Country:     record[1],
-				CountryCode: record[2],
-				Sources:     []string{"geofeed"},
-			},
-		})
-	}
-
-	log.Printf("[INFO] Loaded %d ranges from Geofeed database", len(records))
-	return nil
-}
-
 // Sets the dbLoaded flag in a thread-safe way
 func setDBLoaded(loaded bool) {
 	dbLoadedMutex.Lock()
@@ -501,28 +413,11 @@ func isDBLoaded() bool {
 	return dbLoaded
 }
 
-// Returns the country corresponding to an IP
-func lookupCountry(ip net.IP) string {
-	if !isDBLoaded() {
-		return ""
-	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return ""
-	}
-	ipInt := binaryIPToInt(ip4)
-
-	// Use binary search instead of linear search
-	location := findIPRange(ipInt, ipRanges)
-	if location != nil {
-		return location.location.Country
-	}
-	return ""
-}
-
 // Loads the IP2Location CSV database into memory
 
-// Rate limiting middleware per IP
+// rateLimitMiddleware implements rate limiting per IP address.
+// It enforces request limits within a sliding time window and
+// adds security headers to all responses. Excess requests receive 429 Too Many Requests.
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := getIP(r)
@@ -572,7 +467,9 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Gets the client's IP address
+// getIP extracts the client's IP address from the request.
+// It handles X-Forwarded-For headers for proxy support and falls back
+// to RemoteAddr if no proxy headers are present.
 func getIP(r *http.Request) string {
 	// Check X-Forwarded-For header for proxies
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -636,7 +533,9 @@ func handlerPlain(w http.ResponseWriter, r *http.Request) {
 	logRequest(r, http.StatusOK, 0, nil)
 }
 
-// Health check handler for /health
+// healthHandler implements the health check endpoint.
+// Returns 'ok' if the database is loaded, 'degraded' otherwise.
+// Used for monitoring and load balancer health checks.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	status := "ok"
 	if !isDBLoaded() {
@@ -648,12 +547,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 	logRequest(r, http.StatusOK, 0, nil)
-}
-
-func incrementRequestCounter(source string) {
-	requestMutex.Lock()
-	defer requestMutex.Unlock()
-	requestCounter[source]++
 }
 
 func getMetrics() map[string]interface{} {
@@ -668,7 +561,9 @@ func getMetrics() map[string]interface{} {
 	}
 }
 
-// Metrics handler for /metrics
+// metricsHandler serves runtime metrics about the server.
+// Provides information about database size, request counts,
+// server uptime, and database load status in JSON format.
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	metrics := getMetrics()
 	w.Header().Set("Content-Type", "application/json")
@@ -697,30 +592,6 @@ func setupRoutes(mux *http.ServeMux) {
 	mux.Handle("/metrics", http.HandlerFunc(metricsHandler))
 }
 
-func errorHandler(handler func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        if err := handler(w, r); err != nil {
-            log.Printf("[ERROR] %s %s: %v", r.Method, r.URL.Path, err)
-            
-            switch e := err.(type) {
-            case *httpError:
-                http.Error(w, e.Message, e.Code)
-            default:
-                http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-            }
-        }
-    }
-}
-
-type httpError struct {
-    Code    int
-    Message string
-}
-
-func (e *httpError) Error() string {
-    return e.Message
-}
-
 func startDatabaseRefresher(ctx context.Context, interval time.Duration) {
     ticker := time.NewTicker(interval)
     defer ticker.Stop()
@@ -738,25 +609,28 @@ func startDatabaseRefresher(ctx context.Context, interval time.Duration) {
     }
 }
 
+// main initializes and starts the IP geolocation server.
+// It handles database loading, periodic refresh setup,
+// route configuration, and graceful server startup.
 func main() {
     log.Printf("[INFO] Starting server on %s", serverPort)
 
-    // Carica il database all'avvio
+    // Load database at startup
     if err := loadIPDatabases(); err != nil {
         log.Fatalf("[FATAL] Failed to load initial database: %v", err)
     }
     setDBLoaded(true)
 
-    // Avvia il refresh periodico del database
+    // Start periodic database refresh
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
     go startDatabaseRefresher(ctx, 24*time.Hour)
 
-    // Setup delle route
+    // Setup routes
     mux := http.NewServeMux()
     setupRoutes(mux)
 
-    // Avvia il server
+    // Start the server
     server := &http.Server{
         Addr:         serverPort,
         Handler:      mux,

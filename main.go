@@ -327,6 +327,8 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if pgLoc != nil {
+					// sanitize coordinates: if one of lat/lon is zero-value (missing), drop both
+					sanitizeCoords(&pgLoc.Latitude, &pgLoc.Longitude)
 				// build response from pgLoc
 				respBytes, err := json.Marshal(struct {
 					IP       string   `json:"ip"`
@@ -383,8 +385,11 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Ensure we have the correct IP in the response
-    location.location.IP = ipStr
+	// Ensure we have the correct IP in the response
+	location.location.IP = ipStr
+
+	// sanitize coordinates for in-memory responses as well
+	sanitizeCoords(&location.location.Latitude, &location.location.Longitude)
     
     response, err := json.Marshal(location.location)
     if err != nil {
@@ -414,6 +419,20 @@ func binaryIPToInt(ip net.IP) uint32 {
         return 0
     }
     return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+}
+
+// sanitizeCoords clears both latitude and longitude when one of them is absent
+// or clearly invalid (zero value). This ensures responses never include a lone
+// latitude or longitude value.
+func sanitizeCoords(lat *float64, lon *float64) {
+	if lat == nil || lon == nil {
+		return
+	}
+	// consider zero as missing; also guard against NaN though ParseFloat won't produce NaN here
+	if *lat == 0 || *lon == 0 {
+		*lat = 0
+		*lon = 0
+	}
 }
 
 // loadIP2Location loads and parses the IP location database from CSV format.
@@ -612,14 +631,7 @@ func importCSVToPostgres(path string) error {
 		rdr = gz
 	}
 
-	// We'll stream CSV rows and COPY them
-	conn, err := pgDB.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// Use low-level copy via pq's CopyIn isn't exposed via database/sql; use COPY FROM STDIN through Exec with file streaming via pgconn would be ideal, but to keep dependencies low we will insert in batches.
+	// Stream CSV rows and insert in the same transaction so created table is visible
 	reader := csv.NewReader(rdr)
 	reader.LazyQuotes = true
 	// Read header
@@ -627,7 +639,8 @@ func importCSVToPostgres(path string) error {
 		return err
 	}
 
-	stmt, err := pgDB.Prepare(`INSERT INTO geoip_city_new (ip_from, ip_to, country, city, region, latitude, longitude, source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`)
+	// Prepare insert statement on the transaction so it runs in the same session
+	stmt, err := tx.Prepare(`INSERT INTO geoip_city_new (ip_from, ip_to, country, city, region, latitude, longitude, source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`)
 	if err != nil {
 		return err
 	}

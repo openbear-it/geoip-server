@@ -212,6 +212,38 @@ func downloadDatabase(dbName string) error {
 func loadIPDatabases() error {
 	log.Printf("[INFO] Loading IP database (city DB)...")
 
+	// If PG_DSN is set, import into Postgres and use DB queries
+	pgdsn := os.Getenv("PG_DSN")
+	if pgdsn != "" {
+		log.Printf("[INFO] PG_DSN detected, initializing Postgres import")
+		if err := initPostgres(pgdsn); err != nil {
+			log.Printf("[ERROR] Failed to initialize Postgres: %v", err)
+			return err
+		}
+
+		// Ensure CSV is present locally
+		if err := downloadDatabase(cityDB); err != nil {
+			log.Printf("[ERROR] Failed to download city database: %v", err)
+			return err
+		}
+
+		log.Printf("[INFO] Importing CSV into Postgres...")
+		if err := importCSVToPostgres(cityDB); err != nil {
+			log.Printf("[ERROR] Failed to import CSV to Postgres: %v", err)
+			return err
+		}
+
+		usePG = true
+		setDBLoaded(true)
+		updateMetrics(func(m *metrics) {
+			m.DatabaseSize = 0
+			m.LastRefresh = time.Now()
+		})
+		log.Printf("[INFO] Postgres import completed; using DB for lookups")
+		return nil
+	}
+
+	// Fallback: load into memory
 	if err := downloadDatabase(cityDB); err != nil {
 		log.Printf("[ERROR] Failed to download city database: %v", err)
 		return err

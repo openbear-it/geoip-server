@@ -1,9 +1,10 @@
 package main
 
 import (
-	"context"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
+	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // Global variables for managing IP ranges, database state, and request tracking
@@ -31,6 +34,9 @@ var (
 	startTime      = time.Now()     // Server start time for uptime tracking
 	clientStats    = make(map[string]*clientData) // Stores client request statistics for rate limiting
 	statsMu        sync.RWMutex     // Protects concurrent access to clientStats
+	// Postgres connection (optional)
+	pgDB  *sql.DB
+	usePG bool
 )
 
 // Cache implementation for reducing database lookups
@@ -96,7 +102,6 @@ type clientData struct {
 type GeoLocation struct {
 	IP          string   `json:"ip"`
 	Country     string   `json:"country"`
-	CountryCode string   `json:"country_code,omitempty"`
 	City        string   `json:"city,omitempty"`
 	Region      string   `json:"region,omitempty"`
 	Latitude    float64  `json:"latitude,omitempty"`
@@ -280,7 +285,51 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
     }
 
     ipInt := binaryIPToInt(ip4)
-    location := findIPRange(ipInt, ipRanges)
+		var location *ipRange
+		if usePG {
+			// query Postgres
+			pgLoc, err := queryPGForIP(ipInt)
+			if err != nil {
+				logRequest(r, http.StatusInternalServerError, time.Since(start), err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			if pgLoc != nil {
+				// build response from pgLoc
+				respBytes, err := json.Marshal(struct {
+					IP       string   `json:"ip"`
+					Country  string   `json:"country"`
+					City     string   `json:"city,omitempty"`
+					Latitude float64  `json:"latitude,omitempty"`
+					Longitude float64 `json:"longitude,omitempty"`
+					Sources  []string `json:"sources,omitempty"`
+				}{
+					IP: ipStr,
+					Country: pgLoc.Country,
+					City: pgLoc.City,
+					Latitude: pgLoc.Latitude,
+					Longitude: pgLoc.Longitude,
+					Sources: pgLoc.Sources,
+				})
+				if err != nil {
+					logRequest(r, http.StatusInternalServerError, time.Since(start), err)
+					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(respBytes)
+				setCachedResponse(ipStr, respBytes, 1*time.Hour)
+				updateMetrics(func(m *metrics) {
+					m.CacheMisses++
+					m.TotalRequests++
+					m.AverageLatency = (m.AverageLatency*float64(m.TotalRequests-1) + float64(time.Since(start).Milliseconds())) / float64(m.TotalRequests)
+				})
+				logRequest(r, http.StatusOK, time.Since(start), nil)
+				return
+			}
+			// fallthrough to in-memory if not found in DB
+		}
+		location = findIPRange(ipInt, ipRanges)
 
     if location == nil {
         // If we don't find a range, still return the IP
@@ -440,7 +489,6 @@ func loadCityDB(path string) error {
 			start: binaryIPToInt(s4),
 			end:   binaryIPToInt(e4),
 			location: GeoLocation{
-				CountryCode: country,
 				Country:     country,
 				City:        city,
 				Latitude:    lat,
@@ -466,6 +514,189 @@ func isDBLoaded() bool {
 	dbLoadedMutex.RLock()
 	defer dbLoadedMutex.RUnlock()
 	return dbLoaded
+}
+
+// initPostgres opens a connection to Postgres using the provided DSN
+func initPostgres(dsn string) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
+	}
+	// simple ping to verify
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return err
+	}
+	pgDB = db
+	return nil
+}
+
+// importCSVToPostgres imports the gzipped CSV into a temp table and swaps it in atomically.
+func importCSVToPostgres(path string) error {
+	if pgDB == nil {
+		return fmt.Errorf("pgDB is nil")
+	}
+
+	tx, err := pgDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Create temp table
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS geoip_city_new (
+		ip_from bigint NOT NULL,
+		ip_to bigint NOT NULL,
+		country text,
+		city text,
+		region text,
+		latitude double precision,
+		longitude double precision,
+		source text
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Truncate new table
+	if _, err := tx.Exec(`TRUNCATE geoip_city_new`); err != nil {
+		return err
+	}
+
+	// Use COPY via pq
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var rdr io.Reader = f
+	if filepath.Ext(path) == ".gz" {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		rdr = gz
+	}
+
+	// We'll stream CSV rows and COPY them
+	conn, err := pgDB.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Use low-level copy via pq's CopyIn isn't exposed via database/sql; use COPY FROM STDIN through Exec with file streaming via pgconn would be ideal, but to keep dependencies low we will insert in batches.
+	reader := csv.NewReader(rdr)
+	reader.LazyQuotes = true
+	// Read header
+	if _, err := reader.Read(); err != nil {
+		return err
+	}
+
+	stmt, err := pgDB.Prepare(`INSERT INTO geoip_city_new (ip_from, ip_to, country, city, region, latitude, longitude, source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	batch := 0
+	for {
+		rec, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("[WARN] csv read err: %v", err)
+			continue
+		}
+
+		// parse ip_from/ip_to
+		ipFromStr := rec[0]
+		ipToStr := rec[1]
+		var ipFrom, ipTo int64
+		if strings.Contains(ipFromStr, ".") {
+			p := net.ParseIP(ipFromStr).To4()
+			if p == nil { continue }
+			ipFrom = int64(binaryIPToInt(p))
+		} else {
+			v, _ := strconv.ParseInt(ipFromStr, 10, 64)
+			ipFrom = v
+		}
+		if strings.Contains(ipToStr, ".") {
+			p := net.ParseIP(ipToStr).To4()
+			if p == nil { continue }
+			ipTo = int64(binaryIPToInt(p))
+		} else {
+			v, _ := strconv.ParseInt(ipToStr, 10, 64)
+			ipTo = v
+		}
+
+		country := ""
+		city := ""
+		region := ""
+		lat := 0.0
+		lon := 0.0
+		source := "dbip-city"
+		if len(rec) > 2 { country = rec[2] }
+		if len(rec) > 5 { city = rec[5] }
+		if len(rec) > 4 { region = rec[4] }
+		if len(rec) > 6 { lat, _ = strconv.ParseFloat(rec[6], 64) }
+		if len(rec) > 7 { lon, _ = strconv.ParseFloat(rec[7], 64) }
+
+		if _, err := stmt.Exec(ipFrom, ipTo, country, city, region, lat, lon, source); err != nil {
+			log.Printf("[WARN] insert err: %v", err)
+			continue
+		}
+		batch++
+		if batch%10000 == 0 {
+			log.Printf("[INFO] imported %d rows...", batch)
+		}
+	}
+
+	// Commit transaction to make new table ready
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Swap tables
+	swapTx, err := pgDB.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := swapTx.Exec(`ALTER TABLE IF EXISTS geoip_city RENAME TO geoip_city_old`); err != nil {
+		swapTx.Rollback()
+		return err
+	}
+	if _, err := swapTx.Exec(`ALTER TABLE geoip_city_new RENAME TO geoip_city`); err != nil {
+		swapTx.Rollback()
+		return err
+	}
+	if err := swapTx.Commit(); err != nil {
+		return err
+	}
+
+	// Drop old
+	if _, err := pgDB.Exec(`DROP TABLE IF EXISTS geoip_city_old`); err != nil {
+		log.Printf("[WARN] failed to drop old table: %v", err)
+	}
+
+	return nil
+}
+
+// queryPGForIP looks up the IP in Postgres and returns a GeoLocation if found
+func queryPGForIP(ipInt uint32) (*GeoLocation, error) {
+	if pgDB == nil { return nil, fmt.Errorf("pg not initialized") }
+	var loc GeoLocation
+	row := pgDB.QueryRow(`SELECT country, city, latitude, longitude, source FROM geoip_city WHERE ip_from <= $1 AND ip_to >= $1 LIMIT 1`, int64(ipInt))
+	var source string
+	if err := row.Scan(&loc.Country, &loc.City, &loc.Latitude, &loc.Longitude, &source); err != nil {
+		if err == sql.ErrNoRows { return nil, nil }
+		return nil, err
+	}
+	loc.Sources = []string{source}
+	return &loc, nil
 }
 
 // (removed old ASN-country loader - using single dbip-city gzip CSV instead)

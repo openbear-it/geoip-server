@@ -161,6 +161,7 @@ const (
 	// external datasets
 	githubBaseURL = "https://raw.githubusercontent.com/sapics/ip-location-db/main"
 	cityDB        = "dbip-city/dbip-city-ipv4.csv.gz"
+	asnDB         = "asn/asn-ipv4.csv"
 )
 
 // downloadDatabase scarica il database CSV se non esiste localmente
@@ -230,6 +231,9 @@ func loadIPDatabases() error {
 	}
 	countryDBName := os.Getenv("COUNTRY")
 	asnDBName := os.Getenv("ASN")
+	if asnDBName == "" {
+		asnDBName = asnDB
+	}
 
 	// If PG_DSN is set, import into Postgres and use DB queries
 	pgdsn := os.Getenv("PG_DSN")

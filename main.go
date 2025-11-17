@@ -367,15 +367,28 @@ func loadIPDatabases() error {
 
 			if !skipImport {
 				log.Printf("[INFO] Importing city CSV into Postgres...")
+				start := time.Now()
 				if err := importCSVToPostgres(cityDBName, batchSize); err != nil {
 					setDBLoaded(false)
 					log.Printf("[ERROR] Failed to import city CSV to Postgres: %v", err)
+					// log changelog as failed
+					if fileSum != "" {
+						_ = logChangelog(cityDBName, fileSum, 0, time.Since(start), "failed", err.Error())
+					}
 					return err
 				}
+				duration := time.Since(start)
 				if fileSum != "" {
 					if err := setStoredChecksum(cityDBName, fileSum); err != nil {
 						log.Printf("[WARN] failed to set stored checksum for %s: %v", cityDBName, err)
 					}
+					// attempt to log changelog (rows count is best-effort; importer returns rows via logs)
+					_ = logChangelog(cityDBName, fileSum, 0, duration, "ok", "imported")
+				}
+			} else {
+				// skipped import: record changelog as skipped
+				if fileSum != "" {
+					_ = logChangelog(cityDBName, fileSum, 0, 0, "skipped", "checksum matched")
 				}
 			}
 		}
@@ -407,15 +420,25 @@ func loadIPDatabases() error {
 
 			if !skipImport {
 				log.Printf("[INFO] Importing country CSV into Postgres...")
+				start := time.Now()
 				if err := importCountryCSVToPostgres(countryDBName, batchSize); err != nil {
 					setDBLoaded(false)
 					log.Printf("[ERROR] Failed to import country CSV to Postgres: %v", err)
+					if fileSum != "" {
+						_ = logChangelog(countryDBName, fileSum, 0, time.Since(start), "failed", err.Error())
+					}
 					return err
 				}
+				duration := time.Since(start)
 				if fileSum != "" {
 					if err := setStoredChecksum(countryDBName, fileSum); err != nil {
 						log.Printf("[WARN] failed to set stored checksum for %s: %v", countryDBName, err)
 					}
+					_ = logChangelog(countryDBName, fileSum, 0, duration, "ok", "imported")
+				}
+			} else {
+				if fileSum != "" {
+					_ = logChangelog(countryDBName, fileSum, 0, 0, "skipped", "checksum matched")
 				}
 			}
 		}
@@ -447,15 +470,25 @@ func loadIPDatabases() error {
 
 			if !skipImport {
 				log.Printf("[INFO] Importing ASN CSV into Postgres...")
+				start := time.Now()
 				if err := importASNCSVToPostgres(asnDBName, batchSize); err != nil {
 					setDBLoaded(false)
 					log.Printf("[ERROR] Failed to import ASN CSV to Postgres: %v", err)
+					if fileSum != "" {
+						_ = logChangelog(asnDBName, fileSum, 0, time.Since(start), "failed", err.Error())
+					}
 					return err
 				}
+				duration := time.Since(start)
 				if fileSum != "" {
 					if err := setStoredChecksum(asnDBName, fileSum); err != nil {
 						log.Printf("[WARN] failed to set stored checksum for %s: %v", asnDBName, err)
 					}
+					_ = logChangelog(asnDBName, fileSum, 0, duration, "ok", "imported")
+				}
+			} else {
+				if fileSum != "" {
+					_ = logChangelog(asnDBName, fileSum, 0, 0, "skipped", "checksum matched")
 				}
 			}
 		}
@@ -1465,11 +1498,34 @@ func ensureMetaTable() error {
 	if pgDB == nil {
 		return fmt.Errorf("pg not initialized")
 	}
-	_, err := pgDB.Exec(`CREATE TABLE IF NOT EXISTS geoip_meta (
+	// create meta table
+	if _, err := pgDB.Exec(`CREATE TABLE IF NOT EXISTS geoip_meta (
 		filename text PRIMARY KEY,
 		checksum text,
 		imported_at timestamptz
+	)`); err != nil {
+		return err
+	}
+	// create changelog table
+	_, err := pgDB.Exec(`CREATE TABLE IF NOT EXISTS geoip_changelog (
+		id bigserial PRIMARY KEY,
+		filename text,
+		checksum text,
+		rows_imported bigint,
+		duration_seconds double precision,
+		status text,
+		details text,
+		imported_at timestamptz DEFAULT now()
 	)`)
+	return err
+}
+
+// logChangelog inserts a record into geoip_changelog
+func logChangelog(filename, checksum string, rows int64, duration time.Duration, status, details string) error {
+	if pgDB == nil {
+		return fmt.Errorf("pg not initialized")
+	}
+	_, err := pgDB.Exec(`INSERT INTO geoip_changelog (filename, checksum, rows_imported, duration_seconds, status, details, imported_at) VALUES ($1,$2,$3,$4,$5,$6,now())`, filename, checksum, rows, duration.Seconds(), status, details)
 	return err
 }
 

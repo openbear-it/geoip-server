@@ -417,6 +417,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 			respBytes, err := json.Marshal(struct {
 				IP        string   `json:"ip"`
 				Country   string   `json:"country"`
+				Region    string   `json:"region,omitempty"`
 				City      string   `json:"city,omitempty"`
 				Latitude  float64  `json:"latitude,omitempty"`
 				Longitude float64  `json:"longitude,omitempty"`
@@ -426,6 +427,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 			}{
 				IP:        ipStr,
 				Country:   pgLoc.Country,
+				Region:    pgLoc.Region,
 				City:      pgLoc.City,
 				Latitude:  pgLoc.Latitude,
 				Longitude: pgLoc.Longitude,
@@ -1482,9 +1484,9 @@ func queryPGForIP(ipInt uint32) (*GeoLocation, error) {
 		return nil, fmt.Errorf("pg not initialized")
 	}
 	var loc GeoLocation
-	row := pgDB.QueryRow(`SELECT country, city, latitude, longitude, source FROM geoip_city WHERE ip_from <= $1 AND ip_to >= $1 LIMIT 1`, int64(ipInt))
+	row := pgDB.QueryRow(`SELECT country, city, region, latitude, longitude, source FROM geoip_city WHERE ip_from <= $1 AND ip_to >= $1 LIMIT 1`, int64(ipInt))
 	var source string
-	if err := row.Scan(&loc.Country, &loc.City, &loc.Latitude, &loc.Longitude, &source); err != nil {
+	if err := row.Scan(&loc.Country, &loc.City, &loc.Region, &loc.Latitude, &loc.Longitude, &source); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}

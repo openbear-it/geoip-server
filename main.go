@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
@@ -94,6 +97,20 @@ var (
 	// Postgres connection
 	pgDB  *sql.DB
 	usePG bool
+	// local metadata fallback file when Postgres is not used
+	metaFile = ".geoip_meta.json"
+	// Protection maps
+	blockedIPs      = make(map[string]time.Time)
+	blockMu         sync.Mutex
+	violationCounts = make(map[string]int)
+	lastViolation   = make(map[string]time.Time)
+	violationMu     sync.Mutex
+	// Tunables
+	violationThreshold = 5
+	violationWindow    = 10 * time.Minute
+	blockDuration      = 1 * time.Hour
+	// Cache sizing
+	maxCacheEntries = 5000
 )
 
 func setDBLoaded(loaded bool) {
@@ -126,8 +143,72 @@ func getCachedResponse(key string) ([]byte, bool) {
 
 func setCachedResponse(key string, data []byte, d time.Duration) {
 	cacheMu.Lock()
+	// cleanup expired entries first
+	now := time.Now()
+	for k, e := range cache {
+		if now.After(e.expiration) {
+			delete(cache, k)
+		}
+	}
 	cache[key] = cacheEntry{data: data, expiration: time.Now().Add(d)}
+	// enforce max entries: evict oldest by expiration if necessary
+	if len(cache) > maxCacheEntries {
+		// find oldest
+		var oldestKey string
+		var oldest time.Time
+		first := true
+		for k, e := range cache {
+			if first || e.expiration.Before(oldest) {
+				oldest = e.expiration
+				oldestKey = k
+				first = false
+			}
+		}
+		if oldestKey != "" {
+			delete(cache, oldestKey)
+		}
+	}
 	cacheMu.Unlock()
+}
+
+// isBlocked returns whether an IP is currently blocked; it also removes expired blocks
+func isBlocked(ip string) bool {
+	blockMu.Lock()
+	defer blockMu.Unlock()
+	if t, ok := blockedIPs[ip]; ok {
+		if time.Now().After(t) {
+			delete(blockedIPs, ip)
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// blockIP blocks an IP for the specified duration
+func blockIP(ip string, dur time.Duration) {
+	blockMu.Lock()
+	blockedIPs[ip] = time.Now().Add(dur)
+	blockMu.Unlock()
+}
+
+// recordViolation increments violation counters and blocks IP if threshold reached
+func recordViolation(ip string) {
+	now := time.Now()
+	violationMu.Lock()
+	defer violationMu.Unlock()
+	if lv, ok := lastViolation[ip]; !ok || now.Sub(lv) > violationWindow {
+		violationCounts[ip] = 1
+	} else {
+		violationCounts[ip] = violationCounts[ip] + 1
+	}
+	lastViolation[ip] = now
+	if violationCounts[ip] >= violationThreshold {
+		blockIP(ip, blockDuration)
+		violationCounts[ip] = 0
+		lastViolation[ip] = time.Time{}
+		log.Printf("[WARN] IP %s blocked for %s due to repeated violations", ip, blockDuration)
+	}
 }
 
 func findIPRange(ipInt uint32, ranges []ipRange) *ipRange {
@@ -262,11 +343,40 @@ func loadIPDatabases() error {
 				log.Printf("[ERROR] Failed to download city database: %v", err)
 				return err
 			}
-			log.Printf("[INFO] Importing city CSV into Postgres...")
-			if err := importCSVToPostgres(cityDBName, batchSize); err != nil {
-				setDBLoaded(false)
-				log.Printf("[ERROR] Failed to import city CSV to Postgres: %v", err)
-				return err
+
+			// Attempt to skip import if file checksum hasn't changed since last import
+			if err := ensureMetaTable(); err != nil {
+				log.Printf("[WARN] could not ensure meta table: %v", err)
+			}
+			fileSum, err := fileMD5(cityDBName)
+			if err != nil {
+				log.Printf("[WARN] could not compute md5 for %s: %v", cityDBName, err)
+				fileSum = ""
+			}
+			skipImport := false
+			if fileSum != "" {
+				if stored, err := getStoredChecksum(cityDBName); err == nil {
+					if stored != "" && stored == fileSum {
+						log.Printf("[INFO] city DB unchanged (md5 match), skipping import: %s", cityDBName)
+						skipImport = true
+					}
+				} else {
+					log.Printf("[WARN] could not read stored checksum: %v", err)
+				}
+			}
+
+			if !skipImport {
+				log.Printf("[INFO] Importing city CSV into Postgres...")
+				if err := importCSVToPostgres(cityDBName, batchSize); err != nil {
+					setDBLoaded(false)
+					log.Printf("[ERROR] Failed to import city CSV to Postgres: %v", err)
+					return err
+				}
+				if fileSum != "" {
+					if err := setStoredChecksum(cityDBName, fileSum); err != nil {
+						log.Printf("[WARN] failed to set stored checksum for %s: %v", cityDBName, err)
+					}
+				}
 			}
 		}
 		if countryDBName != "" {
@@ -274,11 +384,39 @@ func loadIPDatabases() error {
 				log.Printf("[ERROR] Failed to download country DB: %v", err)
 				return err
 			}
-			log.Printf("[INFO] Importing country CSV into Postgres...")
-			if err := importCountryCSVToPostgres(countryDBName, batchSize); err != nil {
-				setDBLoaded(false)
-				log.Printf("[ERROR] Failed to import country CSV to Postgres: %v", err)
-				return err
+
+			if err := ensureMetaTable(); err != nil {
+				log.Printf("[WARN] could not ensure meta table: %v", err)
+			}
+			fileSum, err := fileMD5(countryDBName)
+			if err != nil {
+				log.Printf("[WARN] could not compute md5 for %s: %v", countryDBName, err)
+				fileSum = ""
+			}
+			skipImport := false
+			if fileSum != "" {
+				if stored, err := getStoredChecksum(countryDBName); err == nil {
+					if stored != "" && stored == fileSum {
+						log.Printf("[INFO] country DB unchanged (md5 match), skipping import: %s", countryDBName)
+						skipImport = true
+					}
+				} else {
+					log.Printf("[WARN] could not read stored checksum: %v", err)
+				}
+			}
+
+			if !skipImport {
+				log.Printf("[INFO] Importing country CSV into Postgres...")
+				if err := importCountryCSVToPostgres(countryDBName, batchSize); err != nil {
+					setDBLoaded(false)
+					log.Printf("[ERROR] Failed to import country CSV to Postgres: %v", err)
+					return err
+				}
+				if fileSum != "" {
+					if err := setStoredChecksum(countryDBName, fileSum); err != nil {
+						log.Printf("[WARN] failed to set stored checksum for %s: %v", countryDBName, err)
+					}
+				}
 			}
 		}
 		if asnDBName != "" {
@@ -286,11 +424,39 @@ func loadIPDatabases() error {
 				log.Printf("[ERROR] Failed to download ASN DB: %v", err)
 				return err
 			}
-			log.Printf("[INFO] Importing ASN CSV into Postgres...")
-			if err := importASNCSVToPostgres(asnDBName, batchSize); err != nil {
-				setDBLoaded(false)
-				log.Printf("[ERROR] Failed to import ASN CSV to Postgres: %v", err)
-				return err
+
+			if err := ensureMetaTable(); err != nil {
+				log.Printf("[WARN] could not ensure meta table: %v", err)
+			}
+			fileSum, err := fileMD5(asnDBName)
+			if err != nil {
+				log.Printf("[WARN] could not compute md5 for %s: %v", asnDBName, err)
+				fileSum = ""
+			}
+			skipImport := false
+			if fileSum != "" {
+				if stored, err := getStoredChecksum(asnDBName); err == nil {
+					if stored != "" && stored == fileSum {
+						log.Printf("[INFO] ASN DB unchanged (md5 match), skipping import: %s", asnDBName)
+						skipImport = true
+					}
+				} else {
+					log.Printf("[WARN] could not read stored checksum: %v", err)
+				}
+			}
+
+			if !skipImport {
+				log.Printf("[INFO] Importing ASN CSV into Postgres...")
+				if err := importASNCSVToPostgres(asnDBName, batchSize); err != nil {
+					setDBLoaded(false)
+					log.Printf("[ERROR] Failed to import ASN CSV to Postgres: %v", err)
+					return err
+				}
+				if fileSum != "" {
+					if err := setStoredChecksum(asnDBName, fileSum); err != nil {
+						log.Printf("[WARN] failed to set stored checksum for %s: %v", asnDBName, err)
+					}
+				}
 			}
 		}
 
@@ -308,12 +474,10 @@ func loadIPDatabases() error {
 		return nil
 	}
 
-	// Fallback: load into memory
-	if err := downloadDatabase(cityDB); err != nil {
-		log.Printf("[ERROR] Failed to download city database: %v", err)
-		return err
-	}
+	// Fallback: load into memory (no PG_DSN)
+	log.Printf("[INFO] No PG_DSN; using in-memory DB loading")
 
+	// Ensure we have local meta storage available (we will use it to skip unchanged files)
 	// Backup existing ranges
 	if len(ipRanges) > 0 {
 		oldRanges := make([]ipRange, len(ipRanges))
@@ -327,20 +491,106 @@ func loadIPDatabases() error {
 	}
 
 	ipRanges = make([]ipRange, 0)
-	// load in-memory datasets based on env vars
+
+	// City DB
 	if cityDBName != "" {
-		if err := loadCityDB(cityDBName); err != nil {
-			return fmt.Errorf("failed to load city DB: %v", err)
+		if err := downloadDatabase(cityDBName); err != nil {
+			log.Printf("[ERROR] Failed to download city database: %v", err)
+			return err
+		}
+		fileSum, err := fileMD5(cityDBName)
+		if err != nil {
+			log.Printf("[WARN] could not compute md5 for %s: %v", cityDBName, err)
+			fileSum = ""
+		}
+		skip := false
+		if fileSum != "" {
+			if stored, err := getStoredChecksumLocal(cityDBName); err == nil {
+				if stored != "" && stored == fileSum {
+					log.Printf("[INFO] city DB unchanged (md5 match), skipping load: %s", cityDBName)
+					skip = true
+				}
+			} else {
+				log.Printf("[WARN] could not read local checksum: %v", err)
+			}
+		}
+		if !skip {
+			if err := loadCityDB(cityDBName); err != nil {
+				return fmt.Errorf("failed to load city DB: %v", err)
+			}
+			if fileSum != "" {
+				if err := setStoredChecksumLocal(cityDBName, fileSum); err != nil {
+					log.Printf("[WARN] failed to write local checksum for %s: %v", cityDBName, err)
+				}
+			}
 		}
 	}
+
+	// Country DB
 	if countryDBName != "" {
-		if err := loadCountryDB(countryDBName); err != nil {
-			return fmt.Errorf("failed to load country DB: %v", err)
+		if err := downloadDatabase(countryDBName); err != nil {
+			log.Printf("[ERROR] Failed to download country DB: %v", err)
+			return err
+		}
+		fileSum, err := fileMD5(countryDBName)
+		if err != nil {
+			log.Printf("[WARN] could not compute md5 for %s: %v", countryDBName, err)
+			fileSum = ""
+		}
+		skip := false
+		if fileSum != "" {
+			if stored, err := getStoredChecksumLocal(countryDBName); err == nil {
+				if stored != "" && stored == fileSum {
+					log.Printf("[INFO] country DB unchanged (md5 match), skipping load: %s", countryDBName)
+					skip = true
+				}
+			} else {
+				log.Printf("[WARN] could not read local checksum: %v", err)
+			}
+		}
+		if !skip {
+			if err := loadCountryDB(countryDBName); err != nil {
+				return fmt.Errorf("failed to load country DB: %v", err)
+			}
+			if fileSum != "" {
+				if err := setStoredChecksumLocal(countryDBName, fileSum); err != nil {
+					log.Printf("[WARN] failed to write local checksum for %s: %v", countryDBName, err)
+				}
+			}
 		}
 	}
+
+	// ASN DB
 	if asnDBName != "" {
-		if err := loadASNDB(asnDBName); err != nil {
-			return fmt.Errorf("failed to load ASN DB: %v", err)
+		if err := downloadDatabase(asnDBName); err != nil {
+			log.Printf("[ERROR] Failed to download ASN DB: %v", err)
+			return err
+		}
+		fileSum, err := fileMD5(asnDBName)
+		if err != nil {
+			log.Printf("[WARN] could not compute md5 for %s: %v", asnDBName, err)
+			fileSum = ""
+		}
+		skip := false
+		if fileSum != "" {
+			if stored, err := getStoredChecksumLocal(asnDBName); err == nil {
+				if stored != "" && stored == fileSum {
+					log.Printf("[INFO] ASN DB unchanged (md5 match), skipping load: %s", asnDBName)
+					skip = true
+				}
+			} else {
+				log.Printf("[WARN] could not read local checksum: %v", err)
+			}
+		}
+		if !skip {
+			if err := loadASNDB(asnDBName); err != nil {
+				return fmt.Errorf("failed to load ASN DB: %v", err)
+			}
+			if fileSum != "" {
+				if err := setStoredChecksumLocal(asnDBName, fileSum); err != nil {
+					log.Printf("[WARN] failed to write local checksum for %s: %v", asnDBName, err)
+				}
+			}
 		}
 	}
 
@@ -911,7 +1161,6 @@ func importCountryCSVToPostgres(path string, batchSize int) error {
 	if err != nil {
 		return err
 	}
-	// close stmt explicitly at the end or before reassigning
 	defer func() {
 		if stmt != nil {
 			stmt.Close()
@@ -958,7 +1207,18 @@ func importCountryCSVToPostgres(path string, batchSize int) error {
 		}
 
 		if _, err := stmt.Exec(ipFrom, ipTo, country, "country-db"); err != nil {
-			log.Printf("[WARN] country insert err: %v", err)
+			log.Printf("[WARN] country insert err: %v; restarting transaction", err)
+			// transaction may be aborted; rollback and start new tx+stmt
+			stmt.Close()
+			tx.Rollback()
+			tx, err = pgDB.Begin()
+			if err != nil {
+				return err
+			}
+			stmt, err = tx.Prepare(`INSERT INTO geoip_country_new (ip_from, ip_to, country, source) VALUES ($1,$2,$3,$4)`)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 		rows++
@@ -1121,7 +1381,18 @@ func importASNCSVToPostgres(path string, batchSize int) error {
 		}
 
 		if _, err := stmt.Exec(ipFrom, ipTo, asn, org, "asn-db"); err != nil {
-			log.Printf("[WARN] asn insert err: %v", err)
+			log.Printf("[WARN] asn insert err: %v; restarting transaction", err)
+			// rollback and restart transaction+stmt to clear aborted state
+			stmt.Close()
+			tx.Rollback()
+			tx, err = pgDB.Begin()
+			if err != nil {
+				return err
+			}
+			stmt, err = tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 		rows++
@@ -1187,6 +1458,112 @@ func initPostgres(dsn string) error {
 	}
 	pgDB = db
 	return nil
+}
+
+// ensureMetaTable creates a simple metadata table to track imported file checksums
+func ensureMetaTable() error {
+	if pgDB == nil {
+		return fmt.Errorf("pg not initialized")
+	}
+	_, err := pgDB.Exec(`CREATE TABLE IF NOT EXISTS geoip_meta (
+		filename text PRIMARY KEY,
+		checksum text,
+		imported_at timestamptz
+	)`)
+	return err
+}
+
+// getStoredChecksum returns the stored checksum for a given filename (or empty string if none)
+func getStoredChecksum(filename string) (string, error) {
+	if pgDB == nil {
+		return "", fmt.Errorf("pg not initialized")
+	}
+	var cs sql.NullString
+	row := pgDB.QueryRow(`SELECT checksum FROM geoip_meta WHERE filename = $1`, filename)
+	if err := row.Scan(&cs); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return cs.String, nil
+}
+
+// setStoredChecksum inserts or updates the checksum for a filename
+func setStoredChecksum(filename, checksum string) error {
+	if pgDB == nil {
+		return fmt.Errorf("pg not initialized")
+	}
+	_, err := pgDB.Exec(`INSERT INTO geoip_meta(filename, checksum, imported_at) VALUES($1,$2,now())
+		ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum, imported_at = EXCLUDED.imported_at`, filename, checksum)
+	return err
+}
+
+// fileMD5 computes the MD5 checksum of a file (streaming, works for large files)
+func fileMD5(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// local meta storage (fallback when Postgres is not configured)
+type metaEntry struct {
+	Checksum   string    `json:"checksum"`
+	ImportedAt time.Time `json:"imported_at"`
+}
+
+func loadLocalMeta() (map[string]metaEntry, error) {
+	m := make(map[string]metaEntry)
+	data, err := os.ReadFile(metaFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return m, nil
+		}
+		return m, err
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func saveLocalMeta(m map[string]metaEntry) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := metaFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, metaFile)
+}
+
+func getStoredChecksumLocal(filename string) (string, error) {
+	m, err := loadLocalMeta()
+	if err != nil {
+		return "", err
+	}
+	if e, ok := m[filename]; ok {
+		return e.Checksum, nil
+	}
+	return "", nil
+}
+
+func setStoredChecksumLocal(filename, checksum string) error {
+	m, err := loadLocalMeta()
+	if err != nil {
+		return err
+	}
+	m[filename] = metaEntry{Checksum: checksum, ImportedAt: time.Now()}
+	return saveLocalMeta(m)
 }
 
 // importCSVToPostgres imports the gzipped CSV into a temp table and swaps it in atomically.
@@ -1262,7 +1639,11 @@ func importCSVToPostgres(path string, batchSize int) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() {
+		if stmt != nil {
+			stmt.Close()
+		}
+	}()
 
 	batch := 0
 	rows := 0
@@ -1308,7 +1689,18 @@ func importCSVToPostgres(path string, batchSize int) error {
 		source := "dbip-city"
 
 		if _, err := stmt.Exec(ipFrom, ipTo, country, city, region, lat, lon, source); err != nil {
-			log.Printf("[WARN] insert err: %v", err)
+			log.Printf("[WARN] insert err: %v; restarting transaction", err)
+			// rollback and restart transaction+stmt to clear aborted state
+			stmt.Close()
+			tx.Rollback()
+			tx, err = pgDB.Begin()
+			if err != nil {
+				return err
+			}
+			stmt, err = tx.Prepare(`INSERT INTO geoip_city_new (ip_from, ip_to, country, city, region, latitude, longitude, source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 		batch++
@@ -1316,6 +1708,10 @@ func importCSVToPostgres(path string, batchSize int) error {
 		if rows%batchSize == 0 {
 			if err := tx.Commit(); err != nil {
 				return err
+			}
+			// close current stmt before starting new tx
+			if stmt != nil {
+				stmt.Close()
 			}
 			// start a new transaction for next batch
 			tx, err = pgDB.Begin()
@@ -1326,7 +1722,6 @@ func importCSVToPostgres(path string, batchSize int) error {
 			if err != nil {
 				return err
 			}
-			defer stmt.Close()
 			if totalRows > 0 {
 				pct := (float64(rows) / float64(totalRows)) * 100.0
 				log.Printf("[INFO] imported %d/%d rows (%.2f%%)...", rows, totalRows, pct)
@@ -1546,6 +1941,14 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Check if IP is currently blocked
+		if isBlocked(ip) {
+			log.Printf("[WARN] Request from blocked IP %s rejected", ip)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			logRequest(r, http.StatusForbidden, 0, fmt.Errorf("ip blocked"))
+			return
+		}
+
 		statsMu.RLock()
 		data, exists := clientStats[ip]
 		statsMu.RUnlock()
@@ -1571,6 +1974,8 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 			log.Printf("[WARN] Rate limit exceeded for IP %s - UA: %q", ip, r.UserAgent())
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
 			logRequest(r, http.StatusTooManyRequests, 0, fmt.Errorf("rate limit exceeded"))
+			// record violation for potential blocking
+			recordViolation(ip)
 			return
 		}
 
@@ -1702,8 +2107,144 @@ func setupRoutes(mux *http.ServeMux) {
 
 	mux.Handle("/api/myip", rateLimitMiddleware(http.HandlerFunc(handlerJSON)))
 	mux.Handle("/api/myip/plain", rateLimitMiddleware(http.HandlerFunc(handlerPlain)))
+	mux.HandleFunc("/maps", handlerMaps)
 	mux.Handle("/health", http.HandlerFunc(healthHandler))
 	mux.Handle("/metrics", http.HandlerFunc(metricsHandler))
+}
+
+// handlerMaps serves a fullscreen OpenStreetMap (Leaflet) map centered on
+// provided coordinates or resolved from an `ip` query parameter. It displays
+// IP and all available details in a popup/panel.
+func handlerMaps(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	ipStr := q.Get("ip")
+	latStr := q.Get("lat")
+	lonStr := q.Get("lon")
+
+	var lat, lon float64
+	var country, city, region, sources string
+	var asn int
+	var asnOrg string
+
+	// If ip provided try to resolve
+	if ipStr != "" {
+		ip := net.ParseIP(ipStr)
+		if ip != nil {
+			ip4 := ip.To4()
+			if ip4 != nil {
+				ipInt := binaryIPToInt(ip4)
+				if usePG {
+					if loc, err := queryPGForIP(ipInt); err == nil && loc != nil {
+						lat = loc.Latitude
+						lon = loc.Longitude
+						country = loc.Country
+						city = loc.City
+						region = loc.Region
+						if a, o, err := queryASNForIP(ipInt); err == nil && a != 0 {
+							asn = a
+							asnOrg = o
+						}
+						if len(loc.Sources) > 0 {
+							sources = strings.Join(loc.Sources, ", ")
+						}
+					}
+				} else {
+					if r := findIPRange(ipInt, ipRanges); r != nil {
+						lat = r.location.Latitude
+						lon = r.location.Longitude
+						country = r.location.Country
+						city = r.location.City
+						region = r.location.Region
+						if len(r.location.Sources) > 0 {
+							sources = strings.Join(r.location.Sources, ", ")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If explicit lat/lon provided, override
+	if latStr != "" && lonStr != "" {
+		if v, err := strconv.ParseFloat(latStr, 64); err == nil {
+			lat = v
+		}
+		if v, err := strconv.ParseFloat(lonStr, 64); err == nil {
+			lon = v
+		}
+	}
+
+	// Validate we have coordinates
+	if lat == 0 && lon == 0 {
+		http.Error(w, "must provide ?ip=... or ?lat=...&lon=...", http.StatusBadRequest)
+		return
+	}
+
+	// Build details map for display
+	details := map[string]interface{}{
+		"ip":        ipStr,
+		"country":   country,
+		"region":    region,
+		"city":      city,
+		"latitude":  lat,
+		"longitude": lon,
+		"asn":       asn,
+		"asn_org":   asnOrg,
+		"sources":   sources,
+	}
+
+	// Simple template embedded here
+	const tpl = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IP Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="" crossorigin=""/>
+  <style> html,body,#map{ height:100%; margin:0; padding:0 } #panel{ position: absolute; top:10px; right:10px; z-index:1000; background: rgba(255,255,255,0.95); padding:10px; border-radius:6px; max-width:320px; font-family: sans-serif; font-size:14px }</style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+	<h3>IP Details</h3>
+	<pre id="details">{{ .DetailsJSON }}</pre>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+	var lat = {{ .Lat }};
+	var lon = {{ .Lon }};
+	var ip = "{{ .IP }}";
+	var details = {{ .DetailsJSON }};
+	var map = L.map('map').setView([lat, lon], 10);
+	L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ maxZoom: 19 }).addTo(map);
+	var marker = L.marker([lat, lon]).addTo(map);
+	var popup = '<b>' + (ip || '') + '</b><br/>' + JSON.stringify(details, null, 2).replace(/\n/g,'<br/>');
+	marker.bindPopup(popup).openPopup();
+	document.getElementById('details').textContent = JSON.stringify(details, null, 2);
+  </script>
+</body>
+</html>`
+
+	t, err := template.New("map").Parse(tpl)
+	if err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+
+	// Prepare JSON for details (safe insertion)
+	detailsJSONBytes, _ := json.Marshal(details)
+
+	data := map[string]interface{}{
+		"Lat":         lat,
+		"Lon":         lon,
+		"IP":          ipStr,
+		"DetailsJSON": template.JS(string(detailsJSONBytes)),
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := t.Execute(w, data); err != nil {
+		log.Printf("[ERROR] map template exec: %v", err)
+	}
 }
 
 func startDatabaseRefresher(ctx context.Context, interval time.Duration) {

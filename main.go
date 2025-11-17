@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -155,8 +156,8 @@ func sortIPRanges() {
 }
 
 const (
-	serverPort   = "0.0.0.0:8080"
-	requestLimit = 10
+	serverPort     = "0.0.0.0:8080"
+	requestLimit   = 10
 	windowDuration = time.Minute
 	// external datasets
 	githubBaseURL = "https://raw.githubusercontent.com/sapics/ip-location-db/main"
@@ -293,12 +294,12 @@ func loadIPDatabases() error {
 			}
 		}
 
-	usePG = true
-	// free in-memory structures to minimize RAM when using Postgres
-	ipRanges = nil
-	countryRanges = nil
-	asnRanges = nil
-	setDBLoaded(true)
+		usePG = true
+		// free in-memory structures to minimize RAM when using Postgres
+		ipRanges = nil
+		countryRanges = nil
+		asnRanges = nil
+		setDBLoaded(true)
 		updateMetrics(func(m *metrics) {
 			m.DatabaseSize = 0
 			m.LastRefresh = time.Now()
@@ -855,6 +856,15 @@ func importCountryCSVToPostgres(path string, batchSize int) error {
 		batchSize = 10000
 	}
 
+	// attempt to count total rows for progress reporting
+	totalRows, err := countCSVRows(path)
+	if err != nil {
+		log.Printf("[WARN] failed to count country CSV rows: %v", err)
+		totalRows = 0
+	} else {
+		log.Printf("[INFO] country total rows to import: %d", totalRows)
+	}
+
 	tx, err := pgDB.Begin()
 	if err != nil {
 		return err
@@ -964,7 +974,12 @@ func importCountryCSVToPostgres(path string, batchSize int) error {
 			if err != nil {
 				return err
 			}
-			log.Printf("[INFO] imported %d country rows...", rows)
+			if totalRows > 0 {
+				pct := (float64(rows) / float64(totalRows)) * 100.0
+				log.Printf("[INFO] imported %d/%d country rows (%.2f%%)...", rows, totalRows, pct)
+			} else {
+				log.Printf("[INFO] imported %d country rows...", rows)
+			}
 		}
 	}
 
@@ -993,154 +1008,167 @@ func importCountryCSVToPostgres(path string, batchSize int) error {
 	return nil
 }
 
-
 // importASNCSVToPostgres imports ASN CSV into a table (batched)
 func importASNCSVToPostgres(path string, batchSize int) error {
 	if batchSize <= 0 {
 		batchSize = 10000
 	}
 
-	tx, err := pgDB.Begin()
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
+	// attempt to count total rows for progress reporting
+	totalRows, err := countCSVRows(path)
+	if err != nil {
+		log.Printf("[WARN] failed to count ASN CSV rows: %v", err)
+		totalRows = 0
+	} else {
+		log.Printf("[INFO] ASN total rows to import: %d", totalRows)
+	}
 
-		_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS geoip_asn_new (
+	tx, err := pgDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS geoip_asn_new (
 			ip_from bigint NOT NULL,
 			ip_to bigint NOT NULL,
 			asn integer,
 			asn_org text,
 			source text
 		)`)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`TRUNCATE geoip_asn_new`); err != nil {
+		return err
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var rdr io.Reader = f
+	if filepath.Ext(path) == ".gz" {
+		gz, err := gzip.NewReader(f)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`TRUNCATE geoip_asn_new`); err != nil {
-			return err
+		defer gz.Close()
+		rdr = gz
+	}
+	reader := csv.NewReader(rdr)
+	reader.LazyQuotes = true
+	if _, err := reader.Read(); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if stmt != nil {
+			stmt.Close()
+		}
+	}()
+
+	rows := 0
+	for {
+		rec, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("[WARN] asn csv read err: %v", err)
+			continue
+		}
+		if len(rec) < 4 {
+			continue
+		}
+		ipFromStr := rec[0]
+		ipToStr := rec[1]
+		asnStr := rec[2]
+		org := rec[3]
+
+		var ipFrom, ipTo int64
+		if strings.Contains(ipFromStr, ".") {
+			p := net.ParseIP(ipFromStr).To4()
+			if p == nil {
+				continue
+			}
+			ipFrom = int64(binaryIPToInt(p))
+		} else {
+			v, _ := strconv.ParseInt(ipFromStr, 10, 64)
+			ipFrom = v
+		}
+		if strings.Contains(ipToStr, ".") {
+			p := net.ParseIP(ipToStr).To4()
+			if p == nil {
+				continue
+			}
+			ipTo = int64(binaryIPToInt(p))
+		} else {
+			v, _ := strconv.ParseInt(ipToStr, 10, 64)
+			ipTo = v
 		}
 
-		f, err := os.Open(path)
-		if err != nil {
-			return err
+		asn := 0
+		if v, err := strconv.Atoi(asnStr); err == nil {
+			asn = v
 		}
-		defer f.Close()
-		var rdr io.Reader = f
-		if filepath.Ext(path) == ".gz" {
-			gz, err := gzip.NewReader(f)
+
+		if _, err := stmt.Exec(ipFrom, ipTo, asn, org, "asn-db"); err != nil {
+			log.Printf("[WARN] asn insert err: %v", err)
+			continue
+		}
+		rows++
+		if rows%batchSize == 0 {
+			stmt.Close()
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			tx, err = pgDB.Begin()
 			if err != nil {
 				return err
 			}
-			defer gz.Close()
-			rdr = gz
-		}
-		reader := csv.NewReader(rdr)
-		reader.LazyQuotes = true
-		if _, err := reader.Read(); err != nil {
-			return err
-		}
-
-		stmt, err := tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if stmt != nil {
-				stmt.Close()
-			}
-		}()
-
-		rows := 0
-		for {
-			rec, err := reader.Read()
-			if err == io.EOF {
-				break
-			}
+			stmt, err = tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
 			if err != nil {
-				log.Printf("[WARN] asn csv read err: %v", err)
-				continue
+				return err
 			}
-			if len(rec) < 4 {
-				continue
-			}
-			ipFromStr := rec[0]
-			ipToStr := rec[1]
-			asnStr := rec[2]
-			org := rec[3]
-
-			var ipFrom, ipTo int64
-			if strings.Contains(ipFromStr, ".") {
-				p := net.ParseIP(ipFromStr).To4()
-				if p == nil {
-					continue
-				}
-				ipFrom = int64(binaryIPToInt(p))
+			if totalRows > 0 {
+				pct := (float64(rows) / float64(totalRows)) * 100.0
+				log.Printf("[INFO] imported %d/%d asn rows (%.2f%%)...", rows, totalRows, pct)
 			} else {
-				v, _ := strconv.ParseInt(ipFromStr, 10, 64)
-				ipFrom = v
-			}
-			if strings.Contains(ipToStr, ".") {
-				p := net.ParseIP(ipToStr).To4()
-				if p == nil {
-					continue
-				}
-				ipTo = int64(binaryIPToInt(p))
-			} else {
-				v, _ := strconv.ParseInt(ipToStr, 10, 64)
-				ipTo = v
-			}
-
-			asn := 0
-			if v, err := strconv.Atoi(asnStr); err == nil {
-				asn = v
-			}
-
-			if _, err := stmt.Exec(ipFrom, ipTo, asn, org, "asn-db"); err != nil {
-				log.Printf("[WARN] asn insert err: %v", err)
-				continue
-			}
-			rows++
-			if rows%batchSize == 0 {
-				stmt.Close()
-				if err := tx.Commit(); err != nil {
-					return err
-				}
-				tx, err = pgDB.Begin()
-				if err != nil {
-					return err
-				}
-				stmt, err = tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
-				if err != nil {
-					return err
-				}
 				log.Printf("[INFO] imported %d asn rows...", rows)
 			}
 		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-
-		swapTx, err := pgDB.Begin()
-		if err != nil {
-			return err
-		}
-		if _, err := swapTx.Exec(`ALTER TABLE IF EXISTS geoip_asn RENAME TO geoip_asn_old`); err != nil {
-			swapTx.Rollback()
-			return err
-		}
-		if _, err := swapTx.Exec(`ALTER TABLE geoip_asn_new RENAME TO geoip_asn`); err != nil {
-			swapTx.Rollback()
-			return err
-		}
-		if err := swapTx.Commit(); err != nil {
-			return err
-		}
-		if _, err := pgDB.Exec(`DROP TABLE IF EXISTS geoip_asn_old`); err != nil {
-			log.Printf("[WARN] failed to drop old asn table: %v", err)
-		}
-		return nil
 	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	swapTx, err := pgDB.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := swapTx.Exec(`ALTER TABLE IF EXISTS geoip_asn RENAME TO geoip_asn_old`); err != nil {
+		swapTx.Rollback()
+		return err
+	}
+	if _, err := swapTx.Exec(`ALTER TABLE geoip_asn_new RENAME TO geoip_asn`); err != nil {
+		swapTx.Rollback()
+		return err
+	}
+	if err := swapTx.Commit(); err != nil {
+		return err
+	}
+	if _, err := pgDB.Exec(`DROP TABLE IF EXISTS geoip_asn_old`); err != nil {
+		log.Printf("[WARN] failed to drop old asn table: %v", err)
+	}
+	return nil
+}
 
 // isDBLoaded already defined earlier
 
@@ -1163,6 +1191,15 @@ func initPostgres(dsn string) error {
 func importCSVToPostgres(path string, batchSize int) error {
 	if pgDB == nil {
 		return fmt.Errorf("pgDB is nil")
+	}
+
+	// attempt to count total rows for progress reporting
+	totalRows, err := countCSVRows(path)
+	if err != nil {
+		log.Printf("[WARN] failed to count city CSV rows: %v", err)
+		totalRows = 0
+	} else {
+		log.Printf("[INFO] city total rows to import: %d", totalRows)
 	}
 
 	tx, err := pgDB.Begin()
@@ -1280,11 +1317,20 @@ func importCSVToPostgres(path string, batchSize int) error {
 			}
 			// start a new transaction for next batch
 			tx, err = pgDB.Begin()
-			if err != nil { return err }
+			if err != nil {
+				return err
+			}
 			stmt, err = tx.Prepare(`INSERT INTO geoip_city_new (ip_from, ip_to, country, city, region, latitude, longitude, source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`)
-			if err != nil { return err }
+			if err != nil {
+				return err
+			}
 			defer stmt.Close()
-			log.Printf("[INFO] imported %d rows...", rows)
+			if totalRows > 0 {
+				pct := (float64(rows) / float64(totalRows)) * 100.0
+				log.Printf("[INFO] imported %d/%d rows (%.2f%%)...", rows, totalRows, pct)
+			} else {
+				log.Printf("[INFO] imported %d rows...", rows)
+			}
 		}
 	}
 
@@ -1390,6 +1436,44 @@ func extractCityFields(rec []string) (country, city, region string, lat, lon flo
 		}
 	}
 	return
+}
+
+// countCSVRows counts the number of data rows in a CSV file (excluding header).
+// Works with plain and gzipped files. Returns 0 if it cannot be determined.
+func countCSVRows(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	var rdr io.Reader = f
+	if filepath.Ext(path) == ".gz" {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return 0, err
+		}
+		defer gz.Close()
+		rdr = gz
+	}
+
+	scanner := bufio.NewScanner(rdr)
+	// allow larger tokens for long CSV lines
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024*20)
+
+	var count int64 = 0
+	for scanner.Scan() {
+		count++
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	// subtract header if present
+	if count > 0 {
+		count--
+	}
+	return count, nil
 }
 
 // queryPGForIP looks up the IP in Postgres and returns a GeoLocation if found

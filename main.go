@@ -31,7 +31,7 @@ import (
 type asnRange struct {
 	start uint32
 	end   uint32
-	asn   int
+	asn   int64
 	org   string
 }
 
@@ -42,7 +42,7 @@ type GeoLocation struct {
 	Region    string   `json:"region,omitempty"`
 	Latitude  float64  `json:"latitude,omitempty"`
 	Longitude float64  `json:"longitude,omitempty"`
-	ASN       int      `json:"asn,omitempty"`
+	ASN       int64    `json:"asn,omitempty"`
 	ASNOrg    string   `json:"asn_org,omitempty"`
 	TimeZone  string   `json:"timezone,omitempty"`
 	Sources   []string `json:"sources,omitempty"`
@@ -740,7 +740,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 				City      string   `json:"city,omitempty"`
 				Latitude  float64  `json:"latitude,omitempty"`
 				Longitude float64  `json:"longitude,omitempty"`
-				ASN       int      `json:"asn,omitempty"`
+				ASN       int64    `json:"asn,omitempty"`
 				ASNOrg    string   `json:"asn_org,omitempty"`
 				Sources   []string `json:"sources,omitempty"`
 			}{
@@ -781,7 +781,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 			respBytes, err := json.Marshal(struct {
 				IP      string   `json:"ip"`
 				Country string   `json:"country"`
-				ASN     int      `json:"asn,omitempty"`
+				ASN     int64    `json:"asn,omitempty"`
 				ASNOrg  string   `json:"asn_org,omitempty"`
 				Sources []string `json:"sources,omitempty"`
 			}{
@@ -1154,8 +1154,8 @@ func loadASNDB(path string) error {
 			continue
 		}
 
-		asn := 0
-		if v, err := strconv.Atoi(asnStr); err == nil {
+		var asn int64 = 0
+		if v, err := strconv.ParseInt(asnStr, 10, 64); err == nil {
 			asn = v
 		}
 
@@ -2020,11 +2020,11 @@ func queryCountryForIP(ipInt uint32) (*GeoLocation, error) {
 }
 
 // queryASNForIP looks up ASN table and returns ASN info
-func queryASNForIP(ipInt uint32) (int, string, error) {
+func queryASNForIP(ipInt uint32) (int64, string, error) {
 	if pgDB == nil {
 		return 0, "", fmt.Errorf("pg not initialized")
 	}
-	var asn int
+	var asn int64
 	var org string
 	row := pgDB.QueryRow(`SELECT asn, asn_org FROM geoip_asn WHERE ip_from <= $1 AND ip_to >= $1 LIMIT 1`, int64(ipInt))
 	if err := row.Scan(&asn, &org); err != nil {
@@ -2233,7 +2233,7 @@ func handlerMaps(w http.ResponseWriter, r *http.Request) {
 
 	var lat, lon float64
 	var country, city, region, sources string
-	var asn int
+	var asn int64
 	var asnOrg string
 
 	// If ip provided try to resolve

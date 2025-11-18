@@ -337,7 +337,58 @@ func loadIPDatabases() error {
 			}
 		}
 
-		// Download and import configured datasets
+		// Download and import configured datasets (ASN first, then city)
+		if asnDBName != "" {
+			if err := downloadDatabase(asnDBName); err != nil {
+				log.Printf("[ERROR] Failed to download ASN DB: %v", err)
+				return err
+			}
+
+			if err := ensureMetaTable(); err != nil {
+				log.Printf("[WARN] could not ensure meta table: %v", err)
+			}
+			fileSum, err := fileMD5(asnDBName)
+			if err != nil {
+				log.Printf("[WARN] could not compute md5 for %s: %v", asnDBName, err)
+				fileSum = ""
+			}
+			skipImport := false
+			if fileSum != "" {
+				if stored, err := getStoredChecksum(asnDBName); err == nil {
+					if stored != "" && stored == fileSum {
+						log.Printf("[INFO] ASN DB unchanged (md5 match), skipping import: %s", asnDBName)
+						skipImport = true
+					}
+				} else {
+					log.Printf("[WARN] could not read stored checksum: %v", err)
+				}
+			}
+
+			if !skipImport {
+				log.Printf("[INFO] Importing ASN CSV into Postgres...")
+				start := time.Now()
+				if err := importASNCSVToPostgres(asnDBName, batchSize); err != nil {
+					setDBLoaded(false)
+					log.Printf("[ERROR] Failed to import ASN CSV to Postgres: %v", err)
+					if fileSum != "" {
+						_ = logChangelog(asnDBName, fileSum, 0, time.Since(start), "failed", err.Error())
+					}
+					return err
+				}
+				duration := time.Since(start)
+				if fileSum != "" {
+					if err := setStoredChecksum(asnDBName, fileSum); err != nil {
+						log.Printf("[WARN] failed to set stored checksum for %s: %v", asnDBName, err)
+					}
+					_ = logChangelog(asnDBName, fileSum, 0, duration, "ok", "imported")
+				}
+			} else {
+				if fileSum != "" {
+					_ = logChangelog(asnDBName, fileSum, 0, 0, "skipped", "checksum matched")
+				}
+			}
+		}
+
 		if cityDBName != "" {
 			if err := downloadDatabase(cityDBName); err != nil {
 				log.Printf("[ERROR] Failed to download city database: %v", err)
@@ -442,56 +493,7 @@ func loadIPDatabases() error {
 				}
 			}
 		}
-		if asnDBName != "" {
-			if err := downloadDatabase(asnDBName); err != nil {
-				log.Printf("[ERROR] Failed to download ASN DB: %v", err)
-				return err
-			}
-
-			if err := ensureMetaTable(); err != nil {
-				log.Printf("[WARN] could not ensure meta table: %v", err)
-			}
-			fileSum, err := fileMD5(asnDBName)
-			if err != nil {
-				log.Printf("[WARN] could not compute md5 for %s: %v", asnDBName, err)
-				fileSum = ""
-			}
-			skipImport := false
-			if fileSum != "" {
-				if stored, err := getStoredChecksum(asnDBName); err == nil {
-					if stored != "" && stored == fileSum {
-						log.Printf("[INFO] ASN DB unchanged (md5 match), skipping import: %s", asnDBName)
-						skipImport = true
-					}
-				} else {
-					log.Printf("[WARN] could not read stored checksum: %v", err)
-				}
-			}
-
-			if !skipImport {
-				log.Printf("[INFO] Importing ASN CSV into Postgres...")
-				start := time.Now()
-				if err := importASNCSVToPostgres(asnDBName, batchSize); err != nil {
-					setDBLoaded(false)
-					log.Printf("[ERROR] Failed to import ASN CSV to Postgres: %v", err)
-					if fileSum != "" {
-						_ = logChangelog(asnDBName, fileSum, 0, time.Since(start), "failed", err.Error())
-					}
-					return err
-				}
-				duration := time.Since(start)
-				if fileSum != "" {
-					if err := setStoredChecksum(asnDBName, fileSum); err != nil {
-						log.Printf("[WARN] failed to set stored checksum for %s: %v", asnDBName, err)
-					}
-					_ = logChangelog(asnDBName, fileSum, 0, duration, "ok", "imported")
-				}
-			} else {
-				if fileSum != "" {
-					_ = logChangelog(asnDBName, fileSum, 0, 0, "skipped", "checksum matched")
-				}
-			}
-		}
+		// ASN handled earlier
 
 		usePG = true
 		// free in-memory structures to minimize RAM when using Postgres
@@ -524,6 +526,40 @@ func loadIPDatabases() error {
 	}
 
 	ipRanges = make([]ipRange, 0)
+
+	// ASN DB (load before city)
+	if asnDBName != "" {
+		if err := downloadDatabase(asnDBName); err != nil {
+			log.Printf("[ERROR] Failed to download ASN DB: %v", err)
+			return err
+		}
+		fileSum, err := fileMD5(asnDBName)
+		if err != nil {
+			log.Printf("[WARN] could not compute md5 for %s: %v", asnDBName, err)
+			fileSum = ""
+		}
+		skip := false
+		if fileSum != "" {
+			if stored, err := getStoredChecksumLocal(asnDBName); err == nil {
+				if stored != "" && stored == fileSum {
+					log.Printf("[INFO] ASN DB unchanged (md5 match), skipping load: %s", asnDBName)
+					skip = true
+				}
+			} else {
+				log.Printf("[WARN] could not read local checksum: %v", err)
+			}
+		}
+		if !skip {
+			if err := loadASNDB(asnDBName); err != nil {
+				return fmt.Errorf("failed to load ASN DB: %v", err)
+			}
+			if fileSum != "" {
+				if err := setStoredChecksumLocal(asnDBName, fileSum); err != nil {
+					log.Printf("[WARN] failed to write local checksum for %s: %v", asnDBName, err)
+				}
+			}
+		}
+	}
 
 	// City DB
 	if cityDBName != "" {
@@ -1318,23 +1354,24 @@ func importASNCSVToPostgres(path string, batchSize int) error {
 		log.Printf("[INFO] ASN total rows to import: %d", totalRows)
 	}
 
-	tx, err := pgDB.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS geoip_asn_new (
+	// Create/truncate table outside of insert transactions so DDL errors
+	// don't leave the following insert transactions in an aborted state.
+	if _, err := pgDB.Exec(`CREATE TABLE IF NOT EXISTS geoip_asn_new (
 			ip_from bigint NOT NULL,
 			ip_to bigint NOT NULL,
 			asn integer,
 			asn_org text,
 			source text
-		)`)
-	if err != nil {
+		)`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`TRUNCATE geoip_asn_new`); err != nil {
+	if _, err := pgDB.Exec(`TRUNCATE geoip_asn_new`); err != nil {
+		return err
+	}
+
+	// start first transaction for inserts
+	tx, err := pgDB.Begin()
+	if err != nil {
 		return err
 	}
 
@@ -1360,12 +1397,15 @@ func importASNCSVToPostgres(path string, batchSize int) error {
 
 	stmt, err := tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
 	if err != nil {
+		tx.Rollback()
 		return err
 	}
 	defer func() {
 		if stmt != nil {
 			stmt.Close()
 		}
+		// ensure final tx is rolled back if still open
+		_ = tx.Rollback()
 	}()
 
 	rows := 0
@@ -1414,32 +1454,46 @@ func importASNCSVToPostgres(path string, batchSize int) error {
 		}
 
 		if _, err := stmt.Exec(ipFrom, ipTo, asn, org, "asn-db"); err != nil {
-			log.Printf("[WARN] asn insert err: %v; restarting transaction", err)
-			// rollback and restart transaction+stmt to clear aborted state
+			log.Printf("[WARN] asn insert err: %v; rolling back and restarting tx", err)
+			// close current stmt and rollback tx to clear aborted state
 			stmt.Close()
-			tx.Rollback()
+			if rerr := tx.Rollback(); rerr != nil {
+				log.Printf("[WARN] rollback failed after insert error: %v", rerr)
+			}
+			// start a new transaction and prepared statement and continue
 			tx, err = pgDB.Begin()
 			if err != nil {
 				return err
 			}
 			stmt, err = tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
 			if err != nil {
+				tx.Rollback()
 				return err
 			}
 			continue
 		}
 		rows++
 		if rows%batchSize == 0 {
-			stmt.Close()
-			if err := tx.Commit(); err != nil {
-				return err
+			// commit this batch and start a fresh tx+stmt
+			if err := stmt.Close(); err != nil {
+				log.Printf("[WARN] closing stmt before commit: %v", err)
 			}
-			tx, err = pgDB.Begin()
-			if err != nil {
-				return err
+			if err := tx.Commit(); err != nil {
+				log.Printf("[ERROR] commit failed: %v", err)
+				// attempt to start a new tx to continue
+				tx, err = pgDB.Begin()
+				if err != nil {
+					return err
+				}
+			} else {
+				tx, err = pgDB.Begin()
+				if err != nil {
+					return err
+				}
 			}
 			stmt, err = tx.Prepare(`INSERT INTO geoip_asn_new (ip_from, ip_to, asn, asn_org, source) VALUES ($1,$2,$3,$4,$5)`)
 			if err != nil {
+				tx.Rollback()
 				return err
 			}
 			if totalRows > 0 {

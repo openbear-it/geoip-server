@@ -2236,7 +2236,11 @@ func handlerMaps(w http.ResponseWriter, r *http.Request) {
 	var asn int64
 	var asnOrg string
 
-	// If ip provided try to resolve
+	// If ip not provided explicitly, try to detect client IP (X-Forwarded-For or RemoteAddr)
+	if ipStr == "" {
+		ipStr = getIP(r)
+	}
+	// If we have an IP (either from query or detected), try to resolve
 	if ipStr != "" {
 		ip := net.ParseIP(ipStr)
 		if ip != nil {

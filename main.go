@@ -1323,6 +1323,9 @@ func importCountryCSVToPostgres(path string, batchSize int) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Ensure index exists on the newly populated table before swapping it in.
+	ensureRangeIndex("geoip_country_new")
+
 	// swap
 	swapTx, err := pgDB.Begin()
 	if err != nil {
@@ -1515,6 +1518,9 @@ func importASNCSVToPostgres(path string, batchSize int) error {
 		return err
 	}
 
+	// Ensure index exists on the newly populated table before swapping it in.
+	ensureRangeIndex("geoip_asn_new")
+
 	swapTx, err := pgDB.Begin()
 	if err != nil {
 		return err
@@ -1661,6 +1667,37 @@ func saveLocalMeta(m map[string]metaEntry) error {
 	}
 	return os.Rename(tmp, metaFile)
 }
+
+// ensureRangeIndex creates a GiST index on int8range(ip_from, ip_to) for the
+// provided table name (e.g. "geoip_city_new"). It attempts to run
+// CREATE INDEX CONCURRENTLY IF NOT EXISTS and falls back to a retry without
+// the IF NOT EXISTS clause when necessary. ANALYZE is run afterwards.
+func ensureRangeIndex(tableName string) {
+	if pgDB == nil {
+		return
+	}
+	idxName := fmt.Sprintf("idx_%s_iprange", tableName)
+	createSQL := fmt.Sprintf("CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s USING GIST (int8range(ip_from, ip_to, '[]'))", idxName, tableName)
+	if _, err := pgDB.Exec(createSQL); err != nil {
+		// If CREATE INDEX ... IF NOT EXISTS is not supported by the server
+		// or fails for some other reason, try without IF NOT EXISTS and
+		// tolerate "already exists" errors.
+		log.Printf("[WARN] create index (IF NOT EXISTS) failed for %s: %v; retrying without IF NOT EXISTS", tableName, err)
+		createSQL2 := fmt.Sprintf("CREATE INDEX CONCURRENTLY %s ON %s USING GIST (int8range(ip_from, ip_to, '[]'))", idxName, tableName)
+		if _, err2 := pgDB.Exec(createSQL2); err2 != nil {
+			if strings.Contains(err2.Error(), "already exists") {
+				// fine
+			} else {
+				log.Printf("[WARN] create index failed for %s: %v", tableName, err2)
+			}
+		}
+	}
+	// update planner statistics
+	if _, err := pgDB.Exec(fmt.Sprintf("ANALYZE %s", tableName)); err != nil {
+		log.Printf("[WARN] analyze failed for %s: %v", tableName, err)
+	}
+}
+
 
 func getStoredChecksumLocal(filename string) (string, error) {
 	m, err := loadLocalMeta()
@@ -1851,6 +1888,9 @@ func importCSVToPostgres(path string, batchSize int) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+
+	// Ensure index exists on the newly populated table before swapping it in.
+	ensureRangeIndex("geoip_city_new")
 
 	// Swap tables
 	swapTx, err := pgDB.Begin()

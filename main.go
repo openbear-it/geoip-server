@@ -724,6 +724,9 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if pgLoc != nil {
+			if pgLoc.Sources == nil {
+				pgLoc.Sources = []string{}
+			}
 			// sanitize coordinates: if one of lat/lon is zero-value (missing), drop both
 			sanitizeCoords(&pgLoc.Latitude, &pgLoc.Longitude)
 			// try to enrich with ASN info if available
@@ -742,7 +745,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 				Longitude float64  `json:"longitude,omitempty"`
 				ASN       int64    `json:"asn,omitempty"`
 				ASNOrg    string   `json:"asn_org,omitempty"`
-				Sources   []string `json:"sources,omitempty"`
+				Sources   []string `json:"sources"`
 			}{
 				IP:        ipStr,
 				Country:   pgLoc.Country,
@@ -772,6 +775,9 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 		}
 		// if city not found in DB, try country table
 		if cLoc, err := queryCountryForIP(ipInt); err == nil && cLoc != nil {
+			if cLoc.Sources == nil {
+				cLoc.Sources = []string{}
+			}
 			// enrich with ASN if present
 			if asn, org, err := queryASNForIP(ipInt); err == nil && asn != 0 {
 				cLoc.ASN = asn
@@ -783,7 +789,7 @@ func handlerJSON(w http.ResponseWriter, r *http.Request) {
 				Country string   `json:"country"`
 				ASN     int64    `json:"asn,omitempty"`
 				ASNOrg  string   `json:"asn_org,omitempty"`
-				Sources []string `json:"sources,omitempty"`
+				Sources []string `json:"sources"`
 			}{
 				IP:      ipStr,
 				Country: cLoc.Country,
@@ -2257,6 +2263,8 @@ func handlerMaps(w http.ResponseWriter, r *http.Request) {
 						if a, o, err := queryASNForIP(ipInt); err == nil && a != 0 {
 							asn = a
 							asnOrg = o
+							// ensure sources includes ASN info
+							loc.Sources = append(loc.Sources, "asn-db")
 						}
 						if len(loc.Sources) > 0 {
 							sources = strings.Join(loc.Sources, ", ")
@@ -2269,6 +2277,18 @@ func handlerMaps(w http.ResponseWriter, r *http.Request) {
 						country = r.location.Country
 						city = r.location.City
 						region = r.location.Region
+						// attempt to find ASN in in-memory ASN ranges and append source
+						asnRangesMutex.RLock()
+						for _, ar := range asnRanges {
+							if ipInt >= ar.start && ipInt <= ar.end {
+								asn = ar.asn
+								asnOrg = ar.org
+								// append source marker
+								r.location.Sources = append(r.location.Sources, "asn-db")
+								break
+							}
+						}
+						asnRangesMutex.RUnlock()
 						if len(r.location.Sources) > 0 {
 							sources = strings.Join(r.location.Sources, ", ")
 						}
@@ -2319,10 +2339,6 @@ func handlerMaps(w http.ResponseWriter, r *http.Request) {
 </head>
 <body>
   <div id="map"></div>
-  <div id="panel">
-	<h3>IP Details</h3>
-	<pre id="details">{{ .DetailsJSON }}</pre>
-  </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
 	var lat = {{ .Lat }};

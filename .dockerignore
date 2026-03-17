@@ -12,8 +12,8 @@ sonar-project.properties
 scripts/
 
 # ── Build artefacts ─────────────────────────────────────────────────────────
-geoip-server
-ip2server
+/geoip-server
+/ip2server
 *.test
 *.out
 

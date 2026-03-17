@@ -1,6 +1,6 @@
 # ── Compiled binaries ──────────────────────────────────────────────────────────
-geoip-server
-ip2server
+/geoip-server
+/ip2server
 *.exe
 *.out
 *.test

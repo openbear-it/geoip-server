@@ -1,0 +1,29 @@
+# ── Compiled binaries ──────────────────────────────────────────────────────────
+geoip-server
+ip2server
+*.exe
+*.out
+*.test
+
+# ── Go build cache / vendor ────────────────────────────────────────────────────
+vendor/
+
+# ── GeoIP dataset files (large, downloaded at runtime) ─────────────────────────
+*.csv
+*.csv.gz
+asn/
+dbip-city/
+
+# ── Runtime metadata ───────────────────────────────────────────────────────────
+.geoip_meta.json
+
+# ── Logs ───────────────────────────────────────────────────────────────────────
+*.log
+
+# ── OS / editor noise ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

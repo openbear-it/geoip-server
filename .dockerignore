@@ -1,7 +1,36 @@
-# Ignore everything except source and CSV
+# ── Version control ──────────────────────────────────────────────────────────
 .git
+.github
+
+# ── Documentation ───────────────────────────────────────────────────────────
 *.md
-*.log
+README*
+
+# ── CI / tooling config ─────────────────────────────────────────────────────
+sonar-project.properties
+.sonarqube/
+scripts/
+
+# ── Build artefacts ─────────────────────────────────────────────────────────
+geoip-server
+ip2server
 *.test
-Dockerfile
-.dockerignore
+*.out
+
+# ── IDE / OS noise ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+
+# ── Runtime data (downloaded at container start) ─────────────────────────────
+*.csv
+*.csv.gz
+asn/
+dbip-city/
+.geoip_meta.json

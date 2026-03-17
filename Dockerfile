@@ -1,17 +1,16 @@
-# Build stage
+# ── Build stage ───────────────────────────────────────────────────────────────
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-# Copy go.mod if it exists, otherwise skip go.sum
-COPY go.mod ./
-# Only run go mod download if go.mod is present
-RUN [ -f go.mod ] && go mod download || true
+COPY go.mod go.sum ./
+RUN go mod download
 
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o geoip-server main.go
+COPY cmd/ ./cmd/
 
-# Production image
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o geoip-server ./cmd/geoip-server/
+
+# ── Production image ──────────────────────────────────────────────────────────
 FROM scratch
 
 WORKDIR /app

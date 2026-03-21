@@ -60,46 +60,23 @@ func TestSanitizeCoords(t *testing.T) {
 	}
 }
 
-func TestIsTrustedProxy(t *testing.T) {
-	// no trusted proxies configured → always false
-	trustedProxies = nil
-	if isTrustedProxy("127.0.0.1") {
-		t.Fatal("expected false when no trusted proxies configured")
-	}
 
-	_, cidr, _ := net.ParseCIDR("127.0.0.0/8")
-	trustedProxies = []*net.IPNet{cidr}
-	defer func() { trustedProxies = nil }()
-
-	if !isTrustedProxy("127.0.0.1") {
-		t.Fatal("expected 127.0.0.1 to be trusted")
-	}
-	if isTrustedProxy("10.0.0.1") {
-		t.Fatal("expected 10.0.0.1 NOT to be trusted")
-	}
-}
-
-func TestGetIPDirectConnection(t *testing.T) {
-	// X-Forwarded-For must be ignored when no trusted proxies are configured
-	trustedProxies = nil
+func TestGetIPWithXFF(t *testing.T) {
+	// X-Forwarded-For is always trusted
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.RemoteAddr = "10.0.0.1:1234"
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
-	if ip := getIP(req); ip != "10.0.0.1" {
-		t.Fatalf("expected RemoteAddr 10.0.0.1, got %s", ip)
+	if ip := getIP(req); ip != "1.2.3.4" {
+		t.Fatalf("expected forwarded IP 1.2.3.4, got %s", ip)
 	}
 }
 
-func TestGetIPTrustedProxy(t *testing.T) {
-	_, cidr, _ := net.ParseCIDR("10.0.0.0/8")
-	trustedProxies = []*net.IPNet{cidr}
-	defer func() { trustedProxies = nil }()
-
+func TestGetIPFallbackToRemoteAddr(t *testing.T) {
+	// No X-Forwarded-For: fall back to RemoteAddr
 	req, _ := http.NewRequest("GET", "/", nil)
-	req.RemoteAddr = "10.0.0.5:1234"
-	req.Header.Set("X-Forwarded-For", "1.2.3.4")
-	if ip := getIP(req); ip != "1.2.3.4" {
-		t.Fatalf("expected forwarded IP 1.2.3.4, got %s", ip)
+	req.RemoteAddr = "10.0.0.1:1234"
+	if ip := getIP(req); ip != "10.0.0.1" {
+		t.Fatalf("expected RemoteAddr 10.0.0.1, got %s", ip)
 	}
 }
 

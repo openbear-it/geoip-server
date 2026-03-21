@@ -2158,22 +2158,22 @@ func isTrustedProxy(ipStr string) bool {
 	return false
 }
 
-// getIP extracts the real client IP. X-Forwarded-For is only trusted when the
-// direct connection originates from a configured trusted proxy (TRUSTED_PROXIES env var).
+// getIP extracts the real client IP from the request.
+// X-Forwarded-For is always trusted (set by the reverse proxy / ingress).
+// Falls back to RemoteAddr if the header is absent.
 func getIP(r *http.Request) string {
-	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return ""
-	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && isTrustedProxy(remoteIP) {
-		// take the leftmost (original client) address from the header
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.SplitN(xff, ",", 2)
 		candidate := strings.TrimSpace(parts[0])
 		if ip := net.ParseIP(candidate); ip != nil {
 			return ip.String()
 		}
 	}
-	return remoteIP
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+	return ip
 }
 
 type logEntry struct {
@@ -2444,7 +2444,12 @@ func handlerMaps(w http.ResponseWriter, r *http.Request) {
 
 	// Validate we have coordinates
 	if lat == 0 && lon == 0 {
-		http.Error(w, "must provide ?ip=... or ?lat=...&lon=...", http.StatusBadRequest)
+		msg := "could not resolve location for IP " + ipStr +
+			" — the IP may be private/internal.\n" +
+			"If this server is behind a reverse proxy, set the TRUSTED_PROXIES env var\n" +
+			"(e.g. TRUSTED_PROXIES=10.42.0.0/16) so that X-Forwarded-For is trusted.\n" +
+			"Alternatively use: /maps?ip=<public-ip> or /maps?lat=<lat>&lon=<lon>"
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 

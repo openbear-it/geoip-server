@@ -30,6 +30,7 @@ Supports in-memory lookups and PostgreSQL for production-scale deployments.
 - IPv4 geolocation (city, region, country, latitude/longitude)
 - ASN lookup and enrichment
 - Dual storage: **PostgreSQL** (production) or **in-memory** (zero-dep)
+- Automatic downloads from the maintained sapics/ip-location-db release assets
 - Response caching with TTL and LRU eviction
 - Per-IP rate limiting (configurable) with automatic IP blocking
 - Bulk lookup: up to 100 IPs in a single POST request
@@ -113,10 +114,15 @@ All settings are controlled via environment variables.
 | `TRUSTED_PROXIES` | _(none)_ | Comma-separated CIDRs/IPs whose `X-Forwarded-For` is trusted |
 | `INSECURE_TLS` | `true` | Set to `false` to enable TLS verification for dataset downloads |
 | `PG_DSN` | _(none)_ | PostgreSQL DSN. When set, datasets are imported into Postgres |
-| `CITY` | `dbip-city/dbip-city-ipv4.csv.gz` | Path to city dataset |
+| `CITY` | `dbip-city-ipv4.gz` | Path to city dataset (defaults to the sapics/ip-location-db DB-IP city archive) |
 | `COUNTRY` | _(none)_ | Path to country-only dataset (optional fallback) |
-| `ASN` | `asn/asn-ipv4.csv` | Path to ASN dataset |
+| `ASN` | `origin-asn-ipv4.csv` | Path to ASN dataset |
+| `DATASET_BASE_URL` | _(none)_ | Override the base URL for dataset downloads; useful for mirrors or local mirrors |
 | `IMPORT_BATCH_SIZE` | `10000` | Rows per transaction during Postgres import |
+
+### Dataset sources
+
+The default dataset source is the maintained sapics/ip-location-db release repository. The server will try to download the DB-IP city archive and the origin ASN CSV from the latest GitHub release assets unless you override them with `CITY`, `ASN`, or `DATASET_BASE_URL`.
 
 ### Example: run with PostgreSQL
 

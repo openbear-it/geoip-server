@@ -10,7 +10,7 @@ first 10 data rows and up to 5 distinct samples per column (from first 10 rows).
 
 Examples:
   $0 ip2location.csv
-  $0 dbip-city/dbip-city-ipv4.csv.gz
+  $0 dbip-city-ipv4.gz
 EOF
 }
 

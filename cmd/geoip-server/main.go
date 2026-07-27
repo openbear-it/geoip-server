@@ -248,10 +248,36 @@ var (
 const (
 	windowDuration = time.Minute
 	// external datasets
-	githubBaseURL = "https://raw.githubusercontent.com/sapics/ip-location-db/main"
-	cityDB        = "dbip-city/dbip-city-ipv4.csv.gz"
-	asnDB         = "asn/asn-ipv4.csv"
+	githubBaseURL = "https://github.com/sapics/ip-location-db/releases/download/latest"
+	cityDB        = "dbip-city-ipv4.gz"
+	asnDB         = "origin-asn-ipv4.csv"
 )
+
+func buildDatasetURL(dbName string) string {
+	dbName = strings.TrimSpace(dbName)
+	if dbName == "" {
+		return ""
+	}
+	if strings.HasPrefix(dbName, "http://") || strings.HasPrefix(dbName, "https://") {
+		return dbName
+	}
+	if _, err := os.Stat(dbName); err == nil {
+		return dbName
+	}
+
+	name := filepath.Base(dbName)
+	switch name {
+	case "dbip-city-ipv4.csv.gz", "dbip-city-ipv4.csv", "dbip-city-ipv4.gz":
+		name = "dbip-city-ipv4.gz"
+	case "asn-ipv4.csv", "asn.csv", "origin-asn-ipv4.csv":
+		name = "origin-asn-ipv4.csv"
+	}
+
+	if v := os.Getenv("DATASET_BASE_URL"); v != "" {
+		return strings.TrimRight(v, "/") + "/" + name
+	}
+	return strings.TrimRight(githubBaseURL, "/") + "/" + name
+}
 
 // downloadDatabase scarica il database CSV se non esiste localmente
 // downloadDatabase downloads the CSV database if it doesn't exist locally.
@@ -266,7 +292,10 @@ func downloadDatabase(dbName string) error {
 	log.Printf("[INFO] Downloading database %s...", dbName)
 
 	// Create database URL for the city DB
-	url := fmt.Sprintf("%s/%s", githubBaseURL, dbName)
+	url := buildDatasetURL(dbName)
+	if url == "" {
+		return fmt.Errorf("dataset URL is empty")
+	}
 
 	// Create a custom HTTP client with a 30-second timeout.
 	// TLS verification is skipped by default for CDN compatibility;
@@ -895,15 +924,14 @@ func loadCityDB(path string) error {
 
 	idx := make(map[string]int)
 	for i, h := range header {
-		idx[h] = i
+		idx[strings.ToLower(strings.TrimSpace(h))] = i
 	}
 
-	get := func(rec []string, name string, fallback int) string {
-		if pos, ok := idx[name]; ok && pos < len(rec) {
-			return rec[pos]
-		}
-		if fallback >= 0 && fallback < len(rec) {
-			return rec[fallback]
+	get := func(rec []string, names ...string) string {
+		for _, name := range names {
+			if pos, ok := idx[strings.ToLower(strings.TrimSpace(name))]; ok && pos < len(rec) {
+				return rec[pos]
+			}
 		}
 		return ""
 	}
@@ -919,8 +947,8 @@ func loadCityDB(path string) error {
 			continue
 		}
 
-		startStr := get(rec, "ip_from", 0)
-		endStr := get(rec, "ip_to", 1)
+		startStr := get(rec, "ip_from", "ip_range_start", "start_ip")
+		endStr := get(rec, "ip_to", "ip_range_end", "end_ip")
 
 		var startIP, endIP net.IP
 		if startStr != "" && !strings.Contains(startStr, ".") {
@@ -955,10 +983,10 @@ func loadCityDB(path string) error {
 			continue
 		}
 
-		country := get(rec, "country_code", 2)
-		city := get(rec, "city", 5)
-		latStr := get(rec, "latitude", 6)
-		lonStr := get(rec, "longitude", 7)
+		country := get(rec, "country_code", "country")
+		city := get(rec, "city")
+		latStr := get(rec, "latitude")
+		lonStr := get(rec, "longitude")
 
 		lat, _ := strconv.ParseFloat(latStr, 64)
 		lon, _ := strconv.ParseFloat(lonStr, 64)
@@ -1675,7 +1703,6 @@ func ensureRangeIndex(tableName string) {
 		log.Printf("[WARN] analyze failed for %s: %v", tableName, err)
 	}
 }
-
 
 func getStoredChecksumLocal(filename string) (string, error) {
 	m, err := loadLocalMeta()

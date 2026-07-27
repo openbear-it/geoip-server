@@ -114,7 +114,7 @@ All settings are controlled via environment variables.
 | `TRUSTED_PROXIES` | _(none)_ | Comma-separated CIDRs/IPs whose `X-Forwarded-For` is trusted |
 | `INSECURE_TLS` | `true` | Set to `false` to enable TLS verification for dataset downloads |
 | `PG_DSN` | _(none)_ | PostgreSQL DSN. When set, datasets are imported into Postgres |
-| `CITY` | `dbip-city-ipv4.gz` | Path to city dataset (defaults to the sapics/ip-location-db DB-IP city archive) |
+| `CITY` | `dbip-city-ipv4.csv.gz` | Path to city dataset (defaults to the sapics/ip-location-db DB-IP city archive) |
 | `COUNTRY` | _(none)_ | Path to country-only dataset (optional fallback) |
 | `ASN` | `origin-asn-ipv4.csv` | Path to ASN dataset |
 | `DATASET_BASE_URL` | _(none)_ | Override the base URL for dataset downloads; useful for mirrors or local mirrors |

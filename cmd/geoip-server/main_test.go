@@ -62,7 +62,7 @@ func TestSanitizeCoords(t *testing.T) {
 
 func TestBuildDatasetURL(t *testing.T) {
 	t.Setenv("DATASET_BASE_URL", "https://example.test/datasets")
-	if got, want := buildDatasetURL("dbip-city-ipv4.gz"), "https://example.test/datasets/dbip-city-ipv4.gz"; got != want {
+	if got, want := buildDatasetURL("dbip-city-ipv4.gz"), "https://example.test/datasets/dbip-city-ipv4.csv.gz"; got != want {
 		t.Fatalf("buildDatasetURL() = %q, want %q", got, want)
 	}
 }

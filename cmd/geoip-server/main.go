@@ -249,7 +249,7 @@ const (
 	windowDuration = time.Minute
 	// external datasets
 	githubBaseURL = "https://github.com/sapics/ip-location-db/releases/download/latest"
-	cityDB        = "dbip-city-ipv4.gz"
+	cityDB        = "dbip-city-ipv4.csv.gz"
 	asnDB         = "origin-asn-ipv4.csv"
 )
 
@@ -268,7 +268,7 @@ func buildDatasetURL(dbName string) string {
 	name := filepath.Base(dbName)
 	switch name {
 	case "dbip-city-ipv4.csv.gz", "dbip-city-ipv4.csv", "dbip-city-ipv4.gz":
-		name = "dbip-city-ipv4.gz"
+		name = "dbip-city-ipv4.csv.gz"
 	case "asn-ipv4.csv", "asn.csv", "origin-asn-ipv4.csv":
 		name = "origin-asn-ipv4.csv"
 	}
